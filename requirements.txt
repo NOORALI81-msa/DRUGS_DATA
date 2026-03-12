@@ -1,0 +1,13 @@
+# requirements.txt
+scrapy>=2.8.0
+scrapy-playwright>=0.0.28
+playwright>=1.35.0
+selectolax>=0.3.0          # Replaces lxml - 10x faster!
+cssselect>=1.2.0
+fake-useragent>=1.4.0
+requests>=2.28.0
+python-dotenv>=1.0.0
+
+# GUI
+streamlit>=1.30.0
+pandas>=2.0.0
