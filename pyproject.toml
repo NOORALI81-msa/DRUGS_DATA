@@ -1,0 +1,19 @@
+[project]
+name = "geometric-crawler"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "brotli>=1.2.0",
+    "cssselect>=1.2.0",
+    "fake-useragent>=1.4.0",
+    "pandas>=2.3.3",
+    "playwright>=1.35.0",
+    "python-dotenv>=1.0.0",
+    "requests>=2.28.0",
+    "scrapy>=2.8.0",
+    "scrapy-playwright>=0.0.28",
+    "selectolax>=0.3.0",
+    "streamlit>=1.54.0",
+]

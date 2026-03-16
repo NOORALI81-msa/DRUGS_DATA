@@ -168,7 +168,7 @@ class JsonPipeline:
         # Register for interrupt handling
         register_output_file("json", self.filename, lambda: self.count)
 
-        spider.logger.info(f"📁 JSON output: {self.filename}")
+        spider.logger.info(f" JSON output: {self.filename}")
 
     def process_item(self, item, spider):
         # Skip if pipeline is disabled
@@ -178,7 +178,7 @@ class JsonPipeline:
         # 🔧 FIX: Properly filter non-detail items when DETAIL_ONLY is enabled
         if os.getenv("DETAIL_ONLY", "false").lower() == "true":
             if item.get("container_type") != "page_detail":
-                spider.logger.debug(f"⏭️  Skipping non-detail JSON item: {item.get('container_type')}")
+                spider.logger.debug(f"  Skipping non-detail JSON item: {item.get('container_type')}")
                 raise DropItem(f"Not a page_detail: {item.get('container_type')}")
         
         # Truncate large fields to save RAM/storage
@@ -203,13 +203,13 @@ class JsonPipeline:
         self.file.flush()
 
         self.count += 1
-        spider.logger.info(f"💾 JSON saved item {self.count}")
+        spider.logger.info(f"JSON saved item {self.count}")
         return item
 
     def close_spider(self, spider):
         if self.file:
             self.file.close()
-        spider.logger.info(f"✅ JSON done: {self.count}")
+        spider.logger.info(f" JSON done: {self.count}")
         
         # Unregister from interrupt handler (completed normally)
         unregister_output_file("json")
@@ -294,7 +294,7 @@ class CsvPipeline:
         register_output_file("csv", self.filename, lambda: self.count)
 
         mode_label = "append" if self.append_mode else "new"
-        spider.logger.info(f"📁 CSV output ({mode_label}): {self.filename}")
+        spider.logger.info(f" CSV output ({mode_label}): {self.filename}")
 
     # --------------------------------------------------------
     # Flatten nested item.data with clean structure
@@ -419,7 +419,7 @@ class CsvPipeline:
         # 🔧 FIX: Properly filter non-detail items when DETAIL_ONLY is enabled
         if os.getenv("DETAIL_ONLY", "false").lower() == "true":
             if item.get("container_type") != "page_detail":
-                spider.logger.debug(f"⏭️  Skipping non-detail item: {item.get('container_type')}")
+                spider.logger.debug(f"  Skipping non-detail item: {item.get('container_type')}")
                 raise DropItem(f"Not a page_detail: {item.get('container_type')}")
 
         flat = self.flatten_item(item)
@@ -476,7 +476,7 @@ class CsvPipeline:
                 pass
 
         self.count += 1
-        spider.logger.info(f"💾 CSV saved item {self.count}")
+        spider.logger.info(f"CSV saved item {self.count}")
         return item
 
     def close_spider(self, spider):
@@ -504,7 +504,7 @@ class CsvPipeline:
             except:
                 pass
         self.file.close()
-        spider.logger.info(f"✅ CSV done: {self.count}")
+        spider.logger.info(f"CSV done: {self.count}")
         
         # Unregister from interrupt handler (completed normally)
         unregister_output_file("csv")

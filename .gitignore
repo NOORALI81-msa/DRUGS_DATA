@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+
+# Environment & config
+.env
+.python-version
+uv.lock
+.python-version
+# Scrapy crawl state / resume
+.crawl_state/
+
+# Output files
+outputs/
+extractions/
+drug_searches/
+crawler_log_*.txt
+
+# Databases
+*.db
+
+# VS Code
+.vscode/
+
+# Misc
+*.egg-info/
+dist/
+build/

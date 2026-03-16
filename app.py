@@ -654,7 +654,36 @@ SPIDERS = {
 
 def run_spider(cmd: list, output_queue: queue.Queue, extra_env: dict = None):
     """Run spider in subprocess and capture output"""
+    live_log_path = Path(".") / f"crawler_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    log_file = None
+    started_monotonic = time.time()
+    request_count = 0
+    item_count = 0
+
+    def _write_benchmark_snapshot(prefix: str = "Benchmark"):
+        if not log_file:
+            return
+        elapsed = max(0.0, time.time() - started_monotonic)
+        avg_req = (request_count / elapsed) if elapsed > 0 else 0.0
+        avg_items = (item_count / elapsed) if elapsed > 0 else 0.0
+        log_file.write(
+            f"{prefix}: requests_done={request_count}, items={item_count}, "
+            f"avg_req_speed={avg_req:.2f}/s, avg_extract_speed={avg_items:.2f}/s, "
+            f"elapsed={elapsed:.1f}s\n"
+        )
+        log_file.flush()
+
     try:
+        log_file = open(live_log_path, "w", encoding="utf-8")
+        log_file.write(f"Timestamp: {datetime.now().isoformat()}\n")
+        log_file.write("Exit code: running\n")
+        log_file.write(f"Command: {' '.join(cmd)}\n")
+        _write_benchmark_snapshot(prefix="Benchmark (startup)")
+        log_file.write("=" * 80 + "\n")
+        log_file.flush()
+
+        output_queue.put(f" Live crawler log: {live_log_path}")
+
         env = os.environ.copy()
         if extra_env:
             env.update(extra_env)
@@ -680,15 +709,52 @@ def run_spider(cmd: list, output_queue: queue.Queue, extra_env: dict = None):
         )
         
         for line in process.stdout:
-            output_queue.put(line.strip())
+            line_text = line.rstrip("\n")
+            output_queue.put(line_text)
+
+            # Track benchmark counters continuously from both periodic and final stats lines.
+            m = re.search(r"Crawled\s+(\d+)\s+pages.*scraped\s+(\d+)\s+items", line_text)
+            if m:
+                request_count = max(request_count, int(m.group(1)))
+                item_count = max(item_count, int(m.group(2)))
+                _write_benchmark_snapshot(prefix="Benchmark (progress)")
+
+            m_req = re.search(r"['\"]downloader/request_count['\"]\s*:\s*(\d+)", line_text)
+            if m_req:
+                request_count = max(request_count, int(m_req.group(1)))
+
+            m_item = re.search(r"['\"]item_scraped_count['\"]\s*:\s*(\d+)", line_text)
+            if m_item:
+                item_count = max(item_count, int(m_item.group(1)))
+
+            if log_file:
+                log_file.write(line_text + "\n")
+                log_file.flush()
             # Check for parallel processing messages
             if "Extracted in parallel" in line or "Using core" in line:
                 # These are indicators of parallel extraction working
                 pass
         process.wait()
+
+        if log_file:
+            log_file.write("=" * 80 + "\n")
+            _write_benchmark_snapshot(prefix="Benchmark (final)")
+            log_file.write(f"Exit code: {process.returncode}\n")
+            log_file.write(f"Finished: {datetime.now().isoformat()}\n")
+            log_file.flush()
+
         output_queue.put(f"__EXIT_CODE_{process.returncode}__")
     except Exception as e:
+        if log_file:
+            log_file.write("=" * 80 + "\n")
+            _write_benchmark_snapshot(prefix="Benchmark (interrupted)")
+            log_file.write(f"Runner error: {str(e)}\n")
+            log_file.write(f"Finished: {datetime.now().isoformat()}\n")
+            log_file.flush()
         output_queue.put(f"__ERROR__{str(e)}__")
+    finally:
+        if log_file:
+            log_file.close()
 
 
 # Baseline benchmark tuned for stable throughput and polite crawling.
