@@ -194,6 +194,8 @@ class DrugSpider(scrapy.Spider):
 
     # 1mg true drug detail URLs look like /drugs/<slug>-<numeric-id>
     ONE_MG_DETAIL_PATTERN = re.compile(r'/drugs/[a-z0-9-]+-\d+/?$', re.IGNORECASE)
+    # MedlinePlus true drug detail URLs are under /druginfo/meds/
+    MEDLINEPLUS_DETAIL_PATTERN = re.compile(r'/druginfo/meds/[a-z0-9_\-]+\.html$', re.IGNORECASE)
 
     @classmethod
     def from_crawler(cls, crawler, *args, **kwargs):
@@ -576,12 +578,17 @@ class DrugSpider(scrapy.Spider):
 
         remaining_quota = self._remaining_drug_quota()
         drugs_to_process = drug_links if remaining_quota is None else drug_links[:remaining_quota]
+        listing_drill_links = []
         for drug_url in drugs_to_process:
             if self._reached_drug_limit():
                 self.logger.info(f" Reached max drugs limit ({self.max_drugs})")
                 return
             if not self._is_probable_drug_detail_url(drug_url):
-                self.logger.info(f" Skipping non-drug URL: {drug_url}")
+                if self._is_listing_like_url(drug_url):
+                    listing_drill_links.append(drug_url)
+                    self.logger.info(f" Listing/master URL queued for drill-down: {drug_url}")
+                else:
+                    self.logger.info(f" Skipping non-drug URL: {drug_url}")
                 continue
             self.logger.info(f" Queuing drug: {drug_url}")
             yield scrapy.Request(
@@ -594,6 +601,22 @@ class DrugSpider(scrapy.Spider):
                 },
                 errback=self.handle_http_error,
                 priority=100,
+                dont_filter=True,
+            )
+
+        for listing_url in listing_drill_links:
+            if listing_url in self.global_visited:
+                continue
+            self.global_visited.add(listing_url)
+            yield scrapy.Request(
+                listing_url,
+                callback=self.parse_listing,
+                meta={
+                    'use_playwright': False,
+                    'retry_with_playwright': True,
+                },
+                errback=self.handle_http_error,
+                priority=20,
                 dont_filter=True,
             )
 
@@ -683,11 +706,38 @@ class DrugSpider(scrapy.Spider):
     def _is_1mg_domain(self, url):
         return '1mg.com' in urlparse(url).netloc.lower()
 
+    def _is_medlineplus_domain(self, url):
+        return 'medlineplus.gov' in urlparse(url).netloc.lower()
+
     def _is_1mg_drug_detail_url(self, url):
         parsed = urlparse(url)
         if not self._is_1mg_domain(url):
             return False
         return bool(self.ONE_MG_DETAIL_PATTERN.search(parsed.path.lower()))
+
+    def _is_medlineplus_drug_detail_url(self, url):
+        parsed = urlparse(url)
+        if not self._is_medlineplus_domain(url):
+            return False
+        return bool(self.MEDLINEPLUS_DETAIL_PATTERN.search(parsed.path.lower()))
+
+    def _is_listing_like_url(self, url):
+        """Return True for pages that should be parsed as listing pages for deeper links."""
+        parsed = urlparse(url)
+        path = parsed.path.lower().rstrip('/')
+
+        if self._is_special_listing_url(url):
+            return True
+
+        if self._is_medlineplus_domain(url):
+            # Only MedlinePlus drug-info index roots should drill down as listings.
+            if self._is_medlineplus_drug_detail_url(url):
+                return False
+            if path in {'/druginformation', '/druginfo', '/druginfo/herb_all'}:
+                return True
+            return path.startswith('/druginfo')
+
+        return self._is_category_page(url)
 
     def _is_probable_drug_detail_url(self, url):
         """Guardrail to avoid treating listing/navigation pages as drug detail pages."""
@@ -700,6 +750,9 @@ class DrugSpider(scrapy.Spider):
             if path in {'/cart', '/offers', '/help', '/aboutus', '/contactus'}:
                 return False
             return self._is_1mg_drug_detail_url(url)
+
+        if self._is_medlineplus_domain(url):
+            return self._is_medlineplus_drug_detail_url(url)
 
         if self._is_category_page(url):
             return False

@@ -6,7 +6,8 @@ Geometric Self-Healing Crawler Runner with ALL options
 import os
 import sys
 import argparse
-import hashlib
+import re
+from urllib.parse import urlparse
 
 # 🔧 FIX: Add current directory to Python path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -90,7 +91,7 @@ def main():
     
     # Validate URL
     if not args.url and not args.urls:
-        print("❌ Error: Please provide --url or --urls")
+        print(" Error: Please provide --url or --urls")
         sys.exit(1)
     
     # 🔧 FIX: Set environment variables
@@ -155,11 +156,29 @@ def main():
     if args.follow_patterns:
         cmd.extend(['-a', f'follow_patterns={args.follow_patterns}'])
 
-    # Resume support: preserve scheduler queue/dupefilter across restarts.
+    # Per-run state folder: spider + domain + incrementing run number.
     seed_urls = args.url or args.urls or ''
-    state_hash = hashlib.md5(seed_urls.encode('utf-8')).hexdigest()[:12]
-    jobdir = os.path.join('.crawl_state', f"{args.spider}_{state_hash}")
-    os.makedirs('.crawl_state', exist_ok=True)
+    first_url = (seed_urls.split(',')[0] if seed_urls else '').strip()
+    parsed = urlparse(first_url) if first_url else None
+    domain = (parsed.netloc if parsed and parsed.netloc else 'no_domain').lower()
+    domain_key = re.sub(r'[^a-z0-9]+', '_', domain).strip('_') or 'no_domain'
+
+    crawl_state_root = '.crawl_state'
+    os.makedirs(crawl_state_root, exist_ok=True)
+    prefix = f"{args.spider}_{domain_key}_"
+    max_run_no = 0
+    for name in os.listdir(crawl_state_root):
+        full = os.path.join(crawl_state_root, name)
+        if not os.path.isdir(full):
+            continue
+        if not name.startswith(prefix):
+            continue
+        suffix = name[len(prefix):]
+        if suffix.isdigit():
+            max_run_no = max(max_run_no, int(suffix))
+
+    run_no = max_run_no + 1
+    jobdir = os.path.join(crawl_state_root, f"{prefix}{run_no:03d}")
     cmd.extend(['-s', f'JOBDIR={jobdir}'])
     
     # Print configuration
@@ -172,15 +191,15 @@ def main():
     print(f"Max depth: {args.depth}")
     print(f"Threads: {args.threads}")
     print(f"Delay: {args.delay}s")
-    print(f"Parallel extraction: {'✅' if args.parallel else '❌'} ({args.workers} workers)")
-    print(f"LLM Repair: {'✅' if args.use_llm else '❌'} (model: {args.llm_model})")
-    print(f"Use existing file: {'✅' if args.use_existing_file else '❌'}")
-    print(f"Detail only: {'✅' if args.detail_only else '❌'}")
-    print(f"Playwright always: {'✅' if args.playwright_always else '❌'}")
-    print(f"HTTP only: {'✅' if args.http_only else '❌'}")
-    print(f"HTTP after first: {'✅' if use_http_after_first else '❌'}")
+    print(f"Parallel extraction: {'' if args.parallel else ''} ({args.workers} workers)")
+    print(f"LLM Repair: {'' if args.use_llm else ''} (model: {args.llm_model})")
+    print(f"Use existing file: {'' if args.use_existing_file else ''}")
+    print(f"Detail only: {'' if args.detail_only else ''}")
+    print(f"Playwright always: {'' if args.playwright_always else ''}")
+    print(f"HTTP only: {'' if args.http_only else ''}")
+    print(f"HTTP after first: {'' if use_http_after_first else ''}")
     if args.new_file:
-        print("Force new file: ✅")
+        print("Force new file: ")
     if args.output:
         print(f"Output prefix: {args.output}")
     if args.existing_file:
@@ -188,9 +207,9 @@ def main():
     if args.follow_patterns:
         print(f"Follow patterns: {args.follow_patterns}")
     print("\n🛡️ PROTECTIONS:")
-    print(f"  User Agent Rotation: {'✅' if args.rotate_ua and args.protections else '❌'}")
-    print(f"  Random Delay: {'✅' if args.random_delay and args.protections else '❌'}")
-    print(f"  Block Images: {'✅' if args.block_images else '❌'}")
+    print(f"  User Agent Rotation: {'' if args.rotate_ua and args.protections else ''}")
+    print(f"  Random Delay: {'' if args.random_delay and args.protections else ''}")
+    print(f"  Block Images: {'' if args.block_images else ''}")
     print("=" * 80)
     print("\n🚀 Starting crawl...\n")
     
