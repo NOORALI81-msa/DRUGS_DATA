@@ -21,6 +21,7 @@ import os
 import sys
 import atexit
 import signal
+import re
 from datetime import datetime
 from pathlib import Path
 from scrapy.exceptions import DropItem
@@ -126,6 +127,128 @@ atexit.register(_on_exit)
 # ============================================================
 # JSON PIPELINE
 # ============================================================
+
+
+def _extract_run_number(spider) -> int:
+    """Resolve run number from env or JOBDIR suffix like ..._001."""
+    env_run = os.getenv("RUN_NUMBER", "").strip()
+    if env_run.isdigit():
+        return int(env_run)
+
+    try:
+        jobdir = spider.crawler.settings.get("JOBDIR") or ""
+    except Exception:
+        jobdir = ""
+
+    if jobdir:
+        job_name = Path(jobdir).name
+        match = re.search(r"_(\d+)$", job_name)
+        if match:
+            return int(match.group(1))
+
+    return 1
+
+
+def _extract_site_domain(spider) -> str:
+    """Resolve canonical site domain for the current spider run."""
+    env_domain = os.getenv("SITE_DOMAIN", "").strip().lower()
+    if env_domain:
+        return env_domain
+
+    domain = (getattr(spider, "domain", None) or spider.name or "unknown").lower()
+    if domain.startswith("www."):
+        domain = domain[4:]
+    return domain
+
+
+class MongoPipeline:
+    """Save every processed item to MongoDB with spider/domain/run metadata."""
+
+    @classmethod
+    def from_crawler(cls, crawler):
+        return cls(crawler.settings)
+
+    def __init__(self, settings):
+        self.settings = settings
+        self.enabled = False
+        self.client = None
+        self.collection = None
+        self.count = 0
+
+    def open_spider(self, spider):
+        self.enabled = bool(self.settings.getbool("MONGO_ENABLED", True))
+        if not self.enabled:
+            spider.logger.info("Mongo pipeline disabled (MONGO_ENABLED=false)")
+            return
+
+        try:
+            from pymongo import MongoClient
+        except Exception as exc:
+            spider.logger.warning(f"Mongo pipeline disabled (pymongo not installed): {exc}")
+            self.enabled = False
+            return
+
+        mongo_uri = self.settings.get("MONGO_URI", "mongodb://localhost:27017")
+        mongo_db = self.settings.get("MONGO_DATABASE", "geometric_crawler")
+        mongo_collection = self.settings.get("MONGO_COLLECTION", "spider_items")
+
+        self.site_domain = _extract_site_domain(spider)
+        self.run_number = _extract_run_number(spider)
+        self.spider_name = spider.name
+
+        try:
+            self.client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+            self.client.admin.command("ping")
+            self.collection = self.client[mongo_db][mongo_collection]
+            self.collection.create_index(
+                [
+                    ("spider_name", 1),
+                    ("site_domain", 1),
+                    ("run_number", 1),
+                    ("url", 1),
+                ]
+            )
+            spider.logger.info(
+                "Mongo output enabled: %s/%s (spider=%s, domain=%s, run=%s)",
+                mongo_db,
+                mongo_collection,
+                self.spider_name,
+                self.site_domain,
+                self.run_number,
+            )
+        except Exception as exc:
+            spider.logger.warning(f"Mongo pipeline disabled (connection error): {exc}")
+            self.enabled = False
+
+    def process_item(self, item, spider):
+        if not self.enabled or not self.collection:
+            return item
+
+        doc = dict(item)
+        if not doc.get("scraped_at"):
+            doc["scraped_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        doc["spider_name"] = self.spider_name
+        doc["site_domain"] = self.site_domain
+        doc["run_number"] = self.run_number
+        doc["stored_at"] = datetime.utcnow()
+
+        try:
+            self.collection.insert_one(doc)
+            self.count += 1
+        except Exception as exc:
+            spider.logger.warning(f"Mongo insert failed: {exc}")
+
+        return item
+
+    def close_spider(self, spider):
+        if self.client:
+            try:
+                self.client.close()
+            except Exception:
+                pass
+        if self.enabled:
+            spider.logger.info(f"Mongo done: {self.count} items saved")
 
 class JsonPipeline:
 

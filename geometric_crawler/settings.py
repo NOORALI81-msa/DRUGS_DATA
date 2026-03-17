@@ -92,9 +92,16 @@ DOWNLOADER_MIDDLEWARES = {
 # PIPELINES
 # ============================================================
 ITEM_PIPELINES = {
+    'geometric_crawler.pipelines.MongoPipeline': 250,
     'geometric_crawler.pipelines.JsonPipeline': 300,
     'geometric_crawler.pipelines.CsvPipeline': 301,
 }
+
+# MongoDB output settings (all spiders)
+MONGO_ENABLED = os.getenv('MONGO_ENABLED', 'true').lower() == 'true'
+MONGO_URI = os.getenv('MONGO_URI', 'mongodb://localhost:27017')
+MONGO_DATABASE = os.getenv('MONGO_DATABASE', 'geometric_crawler')
+MONGO_COLLECTION = os.getenv('MONGO_COLLECTION', 'spider_items')
 
 # ============================================================
 # LOGGING

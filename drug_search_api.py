@@ -1,4 +1,6 @@
 ﻿import re
+import json
+import sqlite3
 import requests
 import concurrent.futures
 from urllib.parse import quote_plus, urlparse
@@ -11,6 +13,64 @@ TIMEOUT = 10
 SOURCE_WORKERS = 6
 WEB_QUERY_WORKERS = 6
 DDGS_MAX_RESULTS_PER_QUERY = 5
+LOCAL_DB_PATH = "drug_search.db"
+
+
+def init_sqlite_db():
+    conn = sqlite3.connect(LOCAL_DB_PATH)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS search_api_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query TEXT NOT NULL,
+                query_type TEXT,
+                generic_name TEXT,
+                brand_name TEXT,
+                strength TEXT,
+                form TEXT,
+                source_urls_json TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_results_to_sqlite(query, query_type, generic_name, results):
+    if not results:
+        return 0
+
+    conn = sqlite3.connect(LOCAL_DB_PATH)
+    try:
+        rows = []
+        for row in results:
+            rows.append(
+                (
+                    (query or "").strip(),
+                    (query_type or "").strip(),
+                    (generic_name or "").strip(),
+                    (row.get("brand_name") or "").strip(),
+                    (row.get("strength") or "").strip(),
+                    (row.get("form") or "").strip(),
+                    json.dumps(row.get("source_urls") or [], ensure_ascii=False),
+                )
+            )
+
+        conn.executemany(
+            """
+            INSERT INTO search_api_results
+            (query, query_type, generic_name, brand_name, strength, form, source_urls_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        conn.commit()
+        return len(rows)
+    finally:
+        conn.close()
 
 
 def _api_get(url):
@@ -475,12 +535,16 @@ def api_search():
         return jsonify({"error": "missing query. Use /api/search?q=pantoprazole"}), 400
 
     qtype, generic, results = search_variants(q)
+    init_sqlite_db()
+    saved_count = save_results_to_sqlite(q, qtype, generic, results)
 
     return jsonify({
         "query": q,
         "query_type": qtype,
         "generic_name": generic,
         "total_variants": len(results),
+        "saved_to_sqlite": saved_count,
+        "sqlite_db": LOCAL_DB_PATH,
         "results": results,
     })
 
@@ -491,6 +555,7 @@ def home():
 
 
 if __name__ == "__main__":
+    init_sqlite_db()
     print("Server running at http://localhost:5000")
     print("API: http://localhost:5000/api/search?q=")
     app.run(port=5000, debug=True)

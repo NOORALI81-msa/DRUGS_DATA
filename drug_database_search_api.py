@@ -12,6 +12,9 @@ TIMEOUT = 10
 DB_SOURCE_WORKERS = 8
 
 LOCAL_DB_PATH = "drug_search.db"
+MONGO_URI = "mongodb://localhost:27017"
+MONGO_DATABASE = "geometric_crawler"
+MONGO_COLLECTION = "spider_items"
 INDIAN_SOURCE_HINTS = (
     "pharmeasy",
     "1mg",
@@ -517,6 +520,89 @@ def search_local_indian_database(query, generic, brand_names):
     return rows
 
 
+def search_mongo_database(query, generic, brand_names):
+    """Optional Mongo source from extracted spider data."""
+    try:
+        from pymongo import MongoClient
+    except Exception:
+        return []
+
+    rows = []
+    terms = [query, generic] + list(brand_names or [])
+    terms = [t for t in terms if (t or "").strip()]
+    if not terms:
+        return rows
+
+    term_pattern = "|".join(re.escape(t) for t in terms[:6])
+    if not term_pattern:
+        return rows
+
+    query_filter = {
+        "$or": [
+            {"brand_name": {"$regex": term_pattern, "$options": "i"}},
+            {"generic_name": {"$regex": term_pattern, "$options": "i"}},
+            {"salt": {"$regex": term_pattern, "$options": "i"}},
+            {"title": {"$regex": term_pattern, "$options": "i"}},
+            {"data.brand_name": {"$regex": term_pattern, "$options": "i"}},
+            {"data.generic_name": {"$regex": term_pattern, "$options": "i"}},
+            {"data.salt": {"$regex": term_pattern, "$options": "i"}},
+            {"data.title": {"$regex": term_pattern, "$options": "i"}},
+        ]
+    }
+
+    client = None
+    try:
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=4000)
+        collection = client[MONGO_DATABASE][MONGO_COLLECTION]
+        cursor = collection.find(query_filter).sort("_id", -1).limit(300)
+
+        for doc in cursor:
+            data = doc.get("data") if isinstance(doc.get("data"), dict) else {}
+            brand_name = (
+                doc.get("brand_name")
+                or data.get("brand_name")
+                or data.get("title")
+                or doc.get("title")
+                or ""
+            )
+            brand_name = str(brand_name).strip()
+            if not brand_name:
+                continue
+
+            generic_name = (
+                doc.get("generic_name")
+                or data.get("generic_name")
+                or data.get("salt")
+                or doc.get("salt")
+                or generic
+            )
+
+            strength = str(doc.get("strength") or data.get("strength") or "").strip()
+            form = str(doc.get("form") or data.get("form") or "").strip()
+            source_site = str(doc.get("site_domain") or doc.get("domain") or "mongodb").strip()
+            source_url = str(doc.get("url") or data.get("url") or "").strip()
+
+            rows.append({
+                "brand_name": brand_name,
+                "generic_name": _canonical_generic_name(generic_name),
+                "salt": _canonical_generic_name(doc.get("salt") or data.get("salt") or generic_name),
+                "strength": strength,
+                "form": form,
+                "source_site": source_site,
+                "source_url": source_url,
+            })
+    except Exception:
+        return []
+    finally:
+        if client:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    return rows
+
+
 def _is_complete(row):
     if not (row.get("generic_name") or "").strip():
         return False
@@ -622,6 +708,7 @@ def search_variants_from_databases(query):
     with concurrent.futures.ThreadPoolExecutor(max_workers=DB_SOURCE_WORKERS) as executor:
         futures = [
             executor.submit(search_local_indian_database, q, generic, brand_names),
+            executor.submit(search_mongo_database, q, generic, brand_names),
             executor.submit(search_rxnorm_database, q, generic, brand_names),
             executor.submit(search_dailymed_database, q, generic, brand_names),
             executor.submit(search_openfda_database, q, generic, brand_names),

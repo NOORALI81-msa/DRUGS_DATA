@@ -180,6 +180,10 @@ def main():
     run_no = max_run_no + 1
     jobdir = os.path.join(crawl_state_root, f"{prefix}{run_no:03d}")
     cmd.extend(['-s', f'JOBDIR={jobdir}'])
+
+    # Expose metadata for pipelines (e.g., MongoDB)
+    os.environ['RUN_NUMBER'] = str(run_no)
+    os.environ['SITE_DOMAIN'] = domain
     
     # Print configuration
     print("=" * 80)
