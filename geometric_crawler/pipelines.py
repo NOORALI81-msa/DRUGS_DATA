@@ -221,7 +221,7 @@ class MongoPipeline:
             self.enabled = False
 
     def process_item(self, item, spider):
-        if not self.enabled or not self.collection:
+        if not self.enabled or self.collection is None:
             return item
 
         doc = dict(item)

@@ -448,8 +448,7 @@ class DrugSpider(scrapy.Spider):
             self.logger.info(
                 f"♻️ Resuming from existing JOBDIR queue. Last completed drug #{latest_no}: {latest_name} | {latest_url}"
             )
-            self.logger.info("♻️ Seed listing URL will not be fetched again; pending queued URLs will continue from saved state")
-            return
+            self.logger.info("♻️ Pending queued URLs will continue from saved state; seed listing URL will also be fetched as fallback")
         if resume_state["has_state"] and resume_state["url_match"] and not resume_state["has_pending_queue"]:
             self.logger.info("🆕 JOBDIR exists for this URL but has no pending queue; starting fresh from seed URL")
 

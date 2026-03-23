@@ -1,12 +1,3 @@
-# Free proxy pool list
-FREE_PROXIES = [
-    "http://51.158.68.68:8811",
-    "http://185.61.152.137:8080",
-    "http://134.209.29.120:3128",
-    "http://103.47.67.134:8080",
-    "http://103.47.67.134:8080",
-    "http://103.47.67.134:8080",
-]
 # geometric_crawler/config.py
 """
 Central configuration for all protection techniques and features
@@ -29,7 +20,7 @@ class Config:
     
     # Protection Techniques
     ENABLE_USER_AGENT_ROTATION = os.getenv('ENABLE_USER_AGENT_ROTATION', 'true').lower() == 'true'
-    ENABLE_PROXY_ROTATION = os.getenv('ENABLE_PROXY_ROTATION', 'false').lower() == 'true'  # Free proxies
+    ENABLE_PROXY_ROTATION = False
     ENABLE_REQUEST_SIGNING = os.getenv('ENABLE_REQUEST_SIGNING', 'true').lower() == 'true'
     ENABLE_RANDOM_DELAY = os.getenv('ENABLE_RANDOM_DELAY', 'true').lower() == 'true'
     ENABLE_FINGERPRINTING = os.getenv('ENABLE_FINGERPRINTING', 'true').lower() == 'true'
@@ -88,11 +79,12 @@ class Config:
     # 🌐 FREE PROXY LIST (Test proxies, replace with better ones)
     # ============================================================
     FREE_PROXIES = [
-        # Note: These are examples - use working proxies from https://free-proxy-list.net/
         # Format: "protocol://ip:port"
-        # "http://104.16.0.0:80",
-        # "http://104.17.0.0:80",
-        # Add more working proxies here
+        "http://51.158.68.68:8811",
+        "http://185.61.152.137:8080",
+        "http://134.209.29.120:3128",
+        "http://103.47.67.134:8080",
+        "http://103.47.67.134:8080",
     ]
     
     # ============================================================

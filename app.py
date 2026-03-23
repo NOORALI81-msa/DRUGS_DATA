@@ -12,6 +12,7 @@ import queue
 import re
 import socket
 import hashlib
+import shutil
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse
@@ -174,6 +175,55 @@ def check_ollama_running() -> bool:
     except Exception:
         return False
 
+
+def check_mongo_running(mongo_uri: str = "mongodb://localhost:27017") -> bool:
+    """Check if MongoDB is reachable."""
+    try:
+        from pymongo import MongoClient
+        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=2000)
+        client.admin.command("ping")
+        client.close()
+        return True
+    except Exception:
+        return False
+
+
+def start_mongo_from_ui(mongo_uri: str = "mongodb://localhost:27017") -> tuple[bool, str]:
+    """Try to start MongoDB service/process from UI for local development."""
+    if check_mongo_running(mongo_uri):
+        return True, "MongoDB is already running"
+
+    if os.name == "nt":
+        for cmd in (["sc", "start", "MongoDB"], ["net", "start", "MongoDB"]):
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True)
+                output = (proc.stdout or "") + (proc.stderr or "")
+                if proc.returncode == 0 or "already been started" in output.lower():
+                    time.sleep(2)
+                    if check_mongo_running(mongo_uri):
+                        return True, "MongoDB service started"
+            except Exception:
+                pass
+
+    mongod_path = shutil.which("mongod")
+    if mongod_path:
+        try:
+            db_path = Path.home() / "data" / "db"
+            db_path.mkdir(parents=True, exist_ok=True)
+            subprocess.Popen(
+                [mongod_path, "--dbpath", str(db_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            time.sleep(2)
+            if check_mongo_running(mongo_uri):
+                return True, f"MongoDB started with mongod (dbPath={db_path})"
+        except Exception as exc:
+            return False, f"Failed to start mongod: {exc}"
+
+    return False, "Could not start MongoDB automatically. Start MongoDB service manually."
+
 def validate_api_key(provider: str, api_key: str) -> tuple[bool, str]:
     """Validate API key for a provider (basic check)"""
     if not api_key or len(api_key) < 10:
@@ -277,6 +327,16 @@ if 'ollama_running' not in st.session_state:
     st.session_state.ollama_running = check_ollama_running()
 if 'generated_config' not in st.session_state:
     st.session_state.generated_config = None
+if 'mongo_enabled' not in st.session_state:
+    st.session_state.mongo_enabled = os.getenv("MONGO_ENABLED", "true").lower() == "true"
+if 'mongo_uri' not in st.session_state:
+    st.session_state.mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+if 'mongo_database' not in st.session_state:
+    st.session_state.mongo_database = os.getenv("MONGO_DATABASE", "geometric_crawler")
+if 'mongo_collection' not in st.session_state:
+    st.session_state.mongo_collection = os.getenv("MONGO_COLLECTION", "spider_items")
+if 'mongo_running' not in st.session_state:
+    st.session_state.mongo_running = check_mongo_running(st.session_state.mongo_uri)
 
 # Spider configurations
 SPIDERS = {
@@ -939,6 +999,60 @@ def load_results(output_file: str) -> pd.DataFrame | None:
 with st.sidebar:
     st.title("🕷️ Geometric Crawler")
     st.markdown("---")
+
+    st.subheader("🍃 MongoDB Output")
+    st.caption("Enable/disable MongoDB storage and manage local MongoDB service from UI")
+
+    mongo_enabled = st.checkbox(
+        "Enable MongoDB Storage",
+        value=st.session_state.mongo_enabled,
+        help="When enabled, scraped items are stored in MongoDB through MongoPipeline"
+    )
+    st.session_state.mongo_enabled = mongo_enabled
+
+    st.session_state.mongo_uri = st.text_input(
+        "Mongo URI",
+        value=st.session_state.mongo_uri,
+        help="Default local MongoDB URI"
+    )
+    st.session_state.mongo_database = st.text_input(
+        "Mongo Database",
+        value=st.session_state.mongo_database
+    )
+    st.session_state.mongo_collection = st.text_input(
+        "Mongo Collection",
+        value=st.session_state.mongo_collection
+    )
+
+    st.session_state.mongo_running = check_mongo_running(st.session_state.mongo_uri)
+    if st.session_state.mongo_running:
+        st.success("MongoDB is running")
+    else:
+        st.error("MongoDB is not reachable")
+
+    mongo_col1, mongo_col2 = st.columns(2)
+    with mongo_col1:
+        if st.button("▶️ Start MongoDB", help="Try starting MongoDB service/process"):
+            ok, msg = start_mongo_from_ui(st.session_state.mongo_uri)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+            st.rerun()
+    with mongo_col2:
+        if st.button("🔄 Check Mongo", help="Re-check MongoDB connectivity"):
+            st.rerun()
+
+    with st.expander("Mongo Config Summary", expanded=False):
+        st.json({
+            "enabled": st.session_state.mongo_enabled,
+            "uri": st.session_state.mongo_uri,
+            "database": st.session_state.mongo_database,
+            "collection": st.session_state.mongo_collection,
+            "running": st.session_state.mongo_running,
+        })
+
+    st.markdown("---")
     
     spider_key = st.selectbox(
         "Select Spider",
@@ -1064,6 +1178,7 @@ with st.sidebar:
             help="Use the same path in future runs to resume from the same queue.",
         )
     else:
+        st.caption("Resume Previous Queue (same URL): Auto mode reuses the prior crawl state for this spider+URL.")
         st.caption("Auto path is generated from spider + URL and resumes automatically when those match.")
     
     st.markdown("---")
@@ -1761,8 +1876,19 @@ with tab1:
                 f"JOBDIR={effective.get('JOBDIR', 'n/a')}"
             )
             render_resume_status(spider_key, params, effective)
+
+            mongo_enabled_for_run = st.session_state.mongo_enabled
+            if mongo_enabled_for_run and not check_mongo_running(st.session_state.mongo_uri):
+                st.warning("MongoDB is enabled in UI but not reachable. Continuing crawl with MongoDB disabled for this run.")
+                mongo_enabled_for_run = False
             
-            extra_env = {"OUTPUT_FORMAT": output_format}
+            extra_env = {
+                "OUTPUT_FORMAT": output_format,
+                "MONGO_ENABLED": "true" if mongo_enabled_for_run else "false",
+                "MONGO_URI": st.session_state.mongo_uri,
+                "MONGO_DATABASE": st.session_state.mongo_database,
+                "MONGO_COLLECTION": st.session_state.mongo_collection,
+            }
             if output_format == "csv" and hasattr(st.session_state, "csv_output_columns"):
                 csv_cols = st.session_state.csv_output_columns
                 if csv_cols:
@@ -1980,8 +2106,18 @@ with tab1:
                 f"JOBDIR={effective.get('JOBDIR', 'n/a')}"
             )
             render_resume_status(spider_key, params, effective)
+
+            mongo_enabled_for_run = st.session_state.mongo_enabled
+            if mongo_enabled_for_run and not check_mongo_running(st.session_state.mongo_uri):
+                st.warning("MongoDB is enabled in UI but not reachable. Continuing crawl with MongoDB disabled for this run.")
+                mongo_enabled_for_run = False
             
-            extra_env = {}
+            extra_env = {
+                "MONGO_ENABLED": "true" if mongo_enabled_for_run else "false",
+                "MONGO_URI": st.session_state.mongo_uri,
+                "MONGO_DATABASE": st.session_state.mongo_database,
+                "MONGO_COLLECTION": st.session_state.mongo_collection,
+            }
             if output_format == "csv" and hasattr(st.session_state, "csv_output_columns"):
                 csv_cols = st.session_state.csv_output_columns
                 if csv_cols:
@@ -2100,8 +2236,18 @@ with tab1:
                 f"JOBDIR={effective.get('JOBDIR', 'n/a')}"
             )
             render_resume_status(spider_key, params, effective)
+
+            mongo_enabled_for_run = st.session_state.mongo_enabled
+            if mongo_enabled_for_run and not check_mongo_running(st.session_state.mongo_uri):
+                st.warning("MongoDB is enabled in UI but not reachable. Continuing crawl with MongoDB disabled for this run.")
+                mongo_enabled_for_run = False
             
-            extra_env = {}
+            extra_env = {
+                "MONGO_ENABLED": "true" if mongo_enabled_for_run else "false",
+                "MONGO_URI": st.session_state.mongo_uri,
+                "MONGO_DATABASE": st.session_state.mongo_database,
+                "MONGO_COLLECTION": st.session_state.mongo_collection,
+            }
             if output_format == "csv" and hasattr(st.session_state, "csv_output_columns"):
                 csv_cols = st.session_state.csv_output_columns
                 if csv_cols:
