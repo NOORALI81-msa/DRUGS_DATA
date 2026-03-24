@@ -804,6 +804,14 @@ def run_spider(cmd: list, output_queue: queue.Queue, extra_env: dict = None):
             log_file.flush()
 
         output_queue.put(f"__EXIT_CODE_{process.returncode}__")
+    except KeyboardInterrupt:
+        if log_file:
+            log_file.write("=" * 80 + "\n")
+            _write_benchmark_snapshot(prefix="Benchmark (interrupted)")
+            log_file.write(f"Runner interrupted by user (Ctrl+C)\n")
+            log_file.write(f"Finished: {datetime.now().isoformat()}\n")
+            log_file.flush()
+        output_queue.put("__INTERRUPTED__")
     except Exception as e:
         if log_file:
             log_file.write("=" * 80 + "\n")
@@ -2143,6 +2151,9 @@ with tab1:
                             st.session_state.output_log.append("✅ Spider completed successfully!")
                         else:
                             st.session_state.output_log.append(f"❌ Spider exited with code {exit_code}")
+                    elif line.startswith("__INTERRUPTED__"):
+                        exit_code = 130
+                        st.session_state.output_log.append("⚠️ Spider interrupted by user (Ctrl+C) - final benchmark saved")
                     elif line.startswith("__ERROR__"):
                         error = line.replace("__ERROR__", "").replace("__", "")
                         st.session_state.output_log.append(f"❌ Error: {error}")
@@ -2273,6 +2284,9 @@ with tab1:
                             st.session_state.output_log.append("✅ Spider completed successfully!")
                         else:
                             st.session_state.output_log.append(f"❌ Spider exited with code {exit_code}")
+                    elif line.startswith("__INTERRUPTED__"):
+                        exit_code = 130
+                        st.session_state.output_log.append("⚠️ Spider interrupted by user (Ctrl+C) - final benchmark saved")
                     elif line.startswith("__ERROR__"):
                         error = line.replace("__ERROR__", "").replace("__", "")
                         st.session_state.output_log.append(f"❌ Error: {error}")
@@ -2725,6 +2739,7 @@ with tab4:
                         thread = threading.Thread(target=run_scrapy)
                         thread.start()
                         log_placeholder = st.empty()
+                        exit_code = None
                         while thread.is_alive() or not output_queue.empty():
                             try:
                                 line = output_queue.get(timeout=0.1)
@@ -2734,6 +2749,9 @@ with tab4:
                                         st.session_state.output_log.append("✅ Spider completed successfully!")
                                     else:
                                         st.session_state.output_log.append(f"❌ Spider exited with code {exit_code}")
+                                elif line.startswith("__INTERRUPTED__"):
+                                    exit_code = 130  # Standard exit code for Ctrl+C
+                                    st.session_state.output_log.append("⚠️ Spider interrupted by user (Ctrl+C) - final benchmark saved")
                                 elif line.startswith("__ERROR__"):
                                     error = line.replace("__ERROR__", "").replace("__", "")
                                     st.session_state.output_log.append(f"❌ Error: {error}")
@@ -2744,7 +2762,10 @@ with tab4:
                                 continue
                         thread.join()
                         st.session_state.is_running = False
-                        st.success(f"✅ Run complete. Output saved to: {output_filename}")
+                        run_metrics = extract_runtime_metrics(st.session_state.output_log, st.session_state.run_started_at, time.time())
+                        render_runtime_metrics(run_metrics)
+                        log_path = write_persistent_run_log(st.session_state.output_log, run_metrics, exit_code, cmd)
+                        st.success(f"✅ Run complete. Output saved to: {output_filename} | Log: {log_path}")
                     else:
                         st.error("Please save the spider file before running.")
     elif 'llm_output' in st.session_state and st.session_state.llm_output:

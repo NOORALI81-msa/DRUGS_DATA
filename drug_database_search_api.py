@@ -1,4 +1,5 @@
 import re
+import json
 import sqlite3
 import requests
 import concurrent.futures
@@ -176,6 +177,33 @@ def _dedupe_source_urls(source_urls):
         seen.add(key)
         out.append({"site": site, "url": url})
     return out
+
+
+def _dedupe_data_sections(items):
+    seen = set()
+    out = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            key = json.dumps(item, sort_keys=True, ensure_ascii=True)
+        except Exception:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
 
 
 def _fallback_classify_query(query):
@@ -537,16 +565,52 @@ def search_mongo_database(query, generic, brand_names):
     if not term_pattern:
         return rows
 
+    normalized_terms = [_norm(t) for t in terms if _norm(t)]
+
+    def _doc_text_blob(doc):
+        data = doc.get("data") if isinstance(doc.get("data"), dict) else {}
+        parts = [
+            doc.get("brand_name"),
+            doc.get("drug_name"),
+            doc.get("generic_name"),
+            doc.get("salt"),
+            doc.get("title"),
+            doc.get("url"),
+            doc.get("domain"),
+            doc.get("site_domain"),
+            data.get("brand_name"),
+            data.get("drug_name"),
+            data.get("generic_name"),
+            data.get("salt"),
+            data.get("title"),
+            data.get("url"),
+            data.get("drug_url"),
+            data.get("description"),
+            data.get("ingredients"),
+            data.get("full_content"),
+        ]
+        if data:
+            try:
+                parts.append(json.dumps(data, ensure_ascii=True, default=str))
+            except Exception:
+                pass
+        return _norm(" ".join(str(p) for p in parts if p))
+
     query_filter = {
         "$or": [
             {"brand_name": {"$regex": term_pattern, "$options": "i"}},
+            {"drug_name": {"$regex": term_pattern, "$options": "i"}},
             {"generic_name": {"$regex": term_pattern, "$options": "i"}},
             {"salt": {"$regex": term_pattern, "$options": "i"}},
             {"title": {"$regex": term_pattern, "$options": "i"}},
             {"data.brand_name": {"$regex": term_pattern, "$options": "i"}},
+            {"data.drug_name": {"$regex": term_pattern, "$options": "i"}},
             {"data.generic_name": {"$regex": term_pattern, "$options": "i"}},
             {"data.salt": {"$regex": term_pattern, "$options": "i"}},
             {"data.title": {"$regex": term_pattern, "$options": "i"}},
+            {"data.description": {"$regex": term_pattern, "$options": "i"}},
+            {"data.ingredients": {"$regex": term_pattern, "$options": "i"}},
+            {"data.full_content": {"$regex": term_pattern, "$options": "i"}},
         ]
     }
 
@@ -554,13 +618,24 @@ def search_mongo_database(query, generic, brand_names):
     try:
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=4000)
         collection = client[MONGO_DATABASE][MONGO_COLLECTION]
-        cursor = collection.find(query_filter).sort("_id", -1).limit(300)
+        # First, try indexed/targeted matching on common fields.
+        matched_docs = list(collection.find(query_filter).sort("_id", -1).limit(1000))
 
-        for doc in cursor:
+        # Fallback: if nothing found, scan recent docs and match keyword in full stored content.
+        if not matched_docs:
+            scan_cursor = collection.find({}).sort("_id", -1).limit(3000)
+            for doc in scan_cursor:
+                blob = _doc_text_blob(doc)
+                if any(t in blob for t in normalized_terms):
+                    matched_docs.append(doc)
+
+        for doc in matched_docs:
             data = doc.get("data") if isinstance(doc.get("data"), dict) else {}
             brand_name = (
                 doc.get("brand_name")
+                or doc.get("drug_name")
                 or data.get("brand_name")
+                or data.get("drug_name")
                 or data.get("title")
                 or doc.get("title")
                 or ""
@@ -581,6 +656,8 @@ def search_mongo_database(query, generic, brand_names):
             form = str(doc.get("form") or data.get("form") or "").strip()
             source_site = str(doc.get("site_domain") or doc.get("domain") or "mongodb").strip()
             source_url = str(doc.get("url") or data.get("url") or "").strip()
+            if not source_url:
+                source_url = str(data.get("drug_url") or "").strip()
 
             rows.append({
                 "brand_name": brand_name,
@@ -590,6 +667,7 @@ def search_mongo_database(query, generic, brand_names):
                 "form": form,
                 "source_site": source_site,
                 "source_url": source_url,
+                "data_section": _json_safe(data),
             })
     except Exception:
         return []
@@ -697,28 +775,19 @@ def _score_row(row, query, generic):
 
 def search_variants_from_databases(query):
     q = (query or "").strip()
-    qtype, generic, brand_names = resolve_query(q)
+    qtype = "unknown"
+    generic = _canonical_generic_name(q)
+    brand_names = []
 
-    if not generic:
-        # Allow India DB lookup even when external resolver misses the query.
-        generic = q.strip()
-    generic = _canonical_generic_name(generic)
+    # Mongo-only mode: return variants already stored in MongoDB.
+    raw = search_mongo_database(q, generic, brand_names)
 
-    raw = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=DB_SOURCE_WORKERS) as executor:
-        futures = [
-            executor.submit(search_local_indian_database, q, generic, brand_names),
-            executor.submit(search_mongo_database, q, generic, brand_names),
-            executor.submit(search_rxnorm_database, q, generic, brand_names),
-            executor.submit(search_dailymed_database, q, generic, brand_names),
-            executor.submit(search_openfda_database, q, generic, brand_names),
-        ]
-
-        for f in concurrent.futures.as_completed(futures):
-            try:
-                raw.extend(f.result())
-            except Exception:
-                pass
+    all_data_sections = []
+    for row in raw:
+        data_section = row.get("data_section")
+        if isinstance(data_section, dict) and data_section:
+            all_data_sections.append(data_section)
+    all_data_sections = _dedupe_data_sections(all_data_sections)
 
     merged = {}
     for row in raw:
@@ -741,6 +810,10 @@ def search_variants_from_databases(query):
             for field in ("strength", "form", "salt"):
                 if not existing.get(field) and row.get(field):
                     existing[field] = row[field]
+
+            data_section = row.get("data_section")
+            if isinstance(data_section, dict) and data_section:
+                existing["data_sections"].append(data_section)
         else:
             merged[key] = {
                 "brand_name": row.get("brand_name", "").strip(),
@@ -751,6 +824,7 @@ def search_variants_from_databases(query):
                 "source_site": source.get("site", ""),
                 "source_url": source.get("url", ""),
                 "source_urls": [source] if (source.get("site") or source.get("url")) else [],
+                "data_sections": [row.get("data_section")] if isinstance(row.get("data_section"), dict) and row.get("data_section") else [],
             }
 
     all_rows = list(merged.values())
@@ -761,6 +835,7 @@ def search_variants_from_databases(query):
         row["generic_name"] = _canonical_generic_name(row.get("generic_name", ""))
         row["salt"] = _canonical_generic_name(row.get("salt", "")) or row.get("generic_name", "")
         row["source_urls"] = _dedupe_source_urls(row.get("source_urls", []))
+        row["data_sections"] = _dedupe_data_sections(row.get("data_sections", []))
 
         if brand_nm:
             cleaned = _clean_brand_from_url_like_text(
@@ -788,8 +863,8 @@ def search_variants_from_databases(query):
     indian_only = [r for r in filtered if _is_indian_source(r.get("source_site", ""))]
     final_rows = indian_only if indian_only else filtered
 
-    if qtype == "unknown" and final_rows:
-        # Infer generic for brand-first query (e.g., dolo -> paracetamol).
+    if final_rows:
+        # Infer generic from stored rows for brand-first queries.
         qn = _norm(q)
         exact_or_prefix = [
             r for r in final_rows
@@ -802,6 +877,8 @@ def search_variants_from_databases(query):
         if generic_counts:
             generic = generic_counts.most_common(1)[0][0]
             qtype = "brand"
+        else:
+            qtype = "generic"
 
     # Output shape: only source_urls list to avoid repeating source fields multiple times.
     response_rows = []
@@ -813,9 +890,10 @@ def search_variants_from_databases(query):
             "strength": row.get("strength", ""),
             "form": row.get("form", ""),
             "source_urls": _dedupe_source_urls(row.get("source_urls", [])),
+            "data_sections": row.get("data_sections", []),
         })
 
-    return qtype, generic, response_rows, removed_count
+    return qtype, generic, response_rows, removed_count, all_data_sections
 
 
 # ---------------------------------------------------------
@@ -828,17 +906,12 @@ def api_search_database():
     if not q:
         return jsonify({"error": "missing query. Use /api/search-database?q=pantoprazole"}), 400
 
-    qtype, generic, results, removed_count = search_variants_from_databases(q)
+    _, _, _, _, all_data_sections = search_variants_from_databases(q)
 
     return jsonify({
         "query": q,
-        "query_type": qtype,
-        "generic_name": generic,
-        # "total_variants": len(results),
-        # "removed_incomplete_items": removed_count,
-        # "search_mode": "database_only",
-        # "priority": "indian_variants_first",
-        "results": results,
+        "total_found": len(all_data_sections),
+        "data": all_data_sections,
     })
 
 

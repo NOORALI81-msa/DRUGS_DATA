@@ -12,7 +12,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from parsel import Selector
 from pathlib import Path
-from urllib.parse import urlparse, urljoin, urldefrag, parse_qs, urlencode
+from urllib.parse import urlparse, urljoin, urldefrag, parse_qs, parse_qsl, urlencode
 from ..items import ScrapedItem
 
 # Optional Playwright support
@@ -223,6 +223,11 @@ class DrugSpider(scrapy.Spider):
         self.max_subpages_per_drug = int(kwargs.get('max_subpages', 20))  # Max sub-pages per drug
         self.max_retries_per_link = 3  # Max retries before skipping a link
         self.max_consecutive_empty = 3  # Max empty pages before backtracking
+        self.enable_playwright_fallback = kwargs.get('enable_playwright_fallback', 'true').lower() == 'true'
+        self.playwright_for_listing = kwargs.get('playwright_for_listing', 'false').lower() == 'true'
+        self.max_playwright_fallbacks = int(kwargs.get('max_playwright_fallbacks', 60))
+        self.max_failures_per_normalized_url = int(kwargs.get('max_failures_per_url', 3))
+        self.listing_stall_limit = int(kwargs.get('listing_stall_limit', 8))
         
         # USER-CONFIGURABLE LINK PATTERNS (works for ANY site)
         # link_pattern: regex to match drug/product links (e.g., "/prescriptions/" for netmeds)
@@ -245,6 +250,8 @@ class DrugSpider(scrapy.Spider):
         self.visited_subpages = set()  # Track visited sub-pages
         self.global_visited = set()  # Global visited URLs to prevent loops
         self.failed_urls = {}  # Track failed attempt counts per URL
+        self.playwright_fallbacks_used = 0
+        self.listing_stall_by_key = {}
         self.extracted_drug_urls = set()  # Persistent same-site dedupe cache
         self.extracted_urls_file = None
         self.extracted_urls_loaded = False
@@ -263,12 +270,67 @@ class DrugSpider(scrapy.Spider):
             self.logger.info(f" Custom exclude pattern: {self.user_exclude_pattern}")
         max_drugs_text = 'unlimited' if self.max_drugs <= 0 else str(self.max_drugs)
         self.logger.info(f" Drug Spider initialized - Max drugs: {max_drugs_text}, Max depth: {self.max_subpage_depth}, Max sub-pages: {self.max_subpages_per_drug}")
+        self.logger.info(
+            f" Playwright fallback: {'enabled' if self.enable_playwright_fallback else 'disabled'} "
+            f"(listing: {'on' if self.playwright_for_listing else 'off'}, max_fallbacks: {self.max_playwright_fallbacks})"
+        )
 
     def _normalize_drug_url(self, url: str) -> str:
         clean_url, _ = urldefrag((url or '').strip())
         parsed = urlparse(clean_url)
         path = parsed.path.rstrip('/')
         return f"{parsed.scheme}://{parsed.netloc}{path}" if parsed.scheme and parsed.netloc else clean_url
+
+    def _canonicalize_url_key(self, url: str) -> str:
+        clean_url, _ = urldefrag((url or '').strip())
+        parsed = urlparse(clean_url)
+        if not parsed.scheme or not parsed.netloc:
+            return clean_url
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        if query_pairs:
+            query_pairs = sorted(query_pairs)
+        query = urlencode(query_pairs, doseq=True)
+        normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
+        return f"{normalized}?{query}" if query else normalized
+
+    def _failure_key(self, url: str) -> str:
+        parsed = urlparse((url or '').strip())
+        path = parsed.path.lower()
+        # Treat listing-like trap variants as one key so pageNumber loops are cut quickly.
+        if any(token in path for token in ['/marketer/', '/diseases/', '/drug-interactions/']):
+            return f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
+        return self._canonicalize_url_key(url)
+
+    def _get_listing_progress_key(self, url: str) -> str:
+        parsed = urlparse((url or '').strip())
+        if self._is_special_listing_url(url):
+            label = (parse_qs(parsed.query).get('label', [''])[0] or '').lower()
+            if label:
+                return f"{parsed.netloc}|label={label}"
+        return f"{parsed.netloc}{parsed.path.rstrip('/')}"
+
+    def _should_attempt_playwright(self, url: str, meta: dict) -> bool:
+        if not PLAYWRIGHT_AVAILABLE or not self.enable_playwright_fallback:
+            return False
+        if self.playwright_fallbacks_used >= self.max_playwright_fallbacks:
+            return False
+
+        failure_key = self._failure_key(url)
+        if self.failed_urls.get(failure_key, 0) >= self.max_failures_per_normalized_url:
+            return False
+
+        if self._is_listing_like_url(url) and not self.playwright_for_listing:
+            return False
+
+        path_lower = urlparse(url).path.lower()
+        if any(token in path_lower for token in ['/marketer/', '/diseases/', '/drug-interactions/']):
+            if not self._is_probable_drug_detail_url(url):
+                return False
+
+        if 'pagenumber=' in (url or '').lower() and not self._is_probable_drug_detail_url(url):
+            return False
+
+        return bool(meta.get('retry_with_playwright')) and not bool(meta.get('used_playwright'))
 
     def _init_extracted_urls_file(self):
         """Initialize per-site extracted URL archive path."""
@@ -578,6 +640,7 @@ class DrugSpider(scrapy.Spider):
         remaining_quota = self._remaining_drug_quota()
         drugs_to_process = drug_links if remaining_quota is None else drug_links[:remaining_quota]
         listing_drill_links = []
+        queued_drugs = 0
         for drug_url in drugs_to_process:
             if self._reached_drug_limit():
                 self.logger.info(f" Reached max drugs limit ({self.max_drugs})")
@@ -590,6 +653,7 @@ class DrugSpider(scrapy.Spider):
                     self.logger.info(f" Skipping non-drug URL: {drug_url}")
                 continue
             self.logger.info(f" Queuing drug: {drug_url}")
+            queued_drugs += 1
             yield scrapy.Request(
                 drug_url,
                 callback=self.parse_drug_main,
@@ -602,6 +666,37 @@ class DrugSpider(scrapy.Spider):
                 priority=100,
                 dont_filter=True,
             )
+
+        listing_key = self._get_listing_progress_key(response.url)
+        if queued_drugs == 0 and skipped_existing > 0 and not listing_drill_links:
+            self.listing_stall_by_key[listing_key] = self.listing_stall_by_key.get(listing_key, 0) + 1
+            self.logger.info(
+                f"⏸️ Listing stall detected for {listing_key}: "
+                f"{self.listing_stall_by_key[listing_key]}/{self.listing_stall_limit}"
+            )
+        else:
+            self.listing_stall_by_key[listing_key] = 0
+
+        if self.listing_stall_by_key.get(listing_key, 0) >= self.listing_stall_limit:
+            self.logger.warning(
+                f"🛑 Stopping pagination for {listing_key} after {self.listing_stall_limit} stalled pages"
+            )
+            next_label_url = self._get_next_1mg_label_url(response.url)
+            if next_label_url and next_label_url not in self.global_visited:
+                self.logger.info(f"➡️ Letter rollover: moving to next label via {next_label_url}")
+                self.global_visited.add(next_label_url)
+                yield scrapy.Request(
+                    next_label_url,
+                    callback=self.parse_listing,
+                    meta={
+                        'use_playwright': False,
+                        'retry_with_playwright': True,
+                    },
+                    errback=self.handle_http_error,
+                    priority=15,
+                    dont_filter=True,
+                )
+            return
 
         for listing_url in listing_drill_links:
             if listing_url in self.global_visited:
@@ -647,6 +742,19 @@ class DrugSpider(scrapy.Spider):
         # Some 1mg listing controls are rendered as href="#". Build real URLs explicitly.
         # IMPORTANT: Pass original_count (before dedup filtering) so pagination continues even if all drugs on this page were already extracted
         pagination_links.update(self._build_1mg_listing_links(response, original_count > 0))
+
+        # If this label appears exhausted and no next/number links are present, roll to next letter.
+        if (
+            self._is_special_listing_url(response.url)
+            and not pagination_links
+            and original_count == 0
+            and queued_drugs == 0
+            and not listing_drill_links
+        ):
+            next_label_url = self._get_next_1mg_label_url(response.url)
+            if next_label_url and next_label_url not in self.global_visited:
+                self.logger.info(f"➡️ Letter rollover: no links left for label, moving to {next_label_url}")
+                pagination_links.add(next_label_url)
 
         for page_url in pagination_links:
             if page_url not in self.global_visited:
@@ -701,6 +809,23 @@ class DrugSpider(scrapy.Spider):
         base = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
         query = urlencode({'label': label.lower(), 'page': str(page)})
         return f"{base}?{query}"
+
+    def _get_next_1mg_label_url(self, url):
+        """Return next label page (e.g., d->e) for 1mg listing URLs, else None."""
+        if not self._is_special_listing_url(url):
+            return None
+
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query)
+        current_label = (query.get('label', ['a'])[0] or 'a').lower()
+
+        if not re.fullmatch(r'[a-z]', current_label):
+            return None
+        if current_label >= 'z':
+            return None
+
+        next_label = chr(ord(current_label) + 1)
+        return self._build_1mg_listing_url(parsed, next_label, 1)
 
     def _is_1mg_domain(self, url):
         return '1mg.com' in urlparse(url).netloc.lower()
@@ -918,7 +1043,7 @@ class DrugSpider(scrapy.Spider):
             url for url in pending_subpages 
             if url not in visited_subpages 
             and url not in self.global_visited
-            and self.failed_urls.get(url, 0) < self.max_retries_per_link
+            and self.failed_urls.get(self._failure_key(url), 0) < self.max_failures_per_normalized_url
         ]
         
         if pending_subpages:
@@ -970,7 +1095,7 @@ class DrugSpider(scrapy.Spider):
         meta = request.meta.copy()
         
         # First try Playwright fallback if not already used and Playwright is available
-        if PLAYWRIGHT_AVAILABLE and meta.get('retry_with_playwright') and not meta.get('used_playwright'):
+        if self._should_attempt_playwright(url, meta):
             self.logger.warning(f"HTTP failed for {url} - trying Playwright")
             
             meta['playwright'] = True
@@ -980,6 +1105,7 @@ class DrugSpider(scrapy.Spider):
             ]
             meta['used_playwright'] = True
             meta['retry_with_playwright'] = False
+            self.playwright_fallbacks_used += 1
             
             yield scrapy.Request(
                 url,
@@ -992,7 +1118,8 @@ class DrugSpider(scrapy.Spider):
             return
         
         # Playwright also failed - backtrack
-        self.failed_urls[url] = self.failed_urls.get(url, 0) + 1
+        failure_key = self._failure_key(url)
+        self.failed_urls[failure_key] = self.failed_urls.get(failure_key, 0) + 1
         self.logger.warning(f"Both HTTP and Playwright failed for {url}")
         
         # Add to global visited to prevent retrying
@@ -1161,6 +1288,86 @@ class DrugSpider(scrapy.Spider):
     def _parse_universal_sections(self, selector, html, url):
         """UNIVERSAL drug page parser - extracts sections into standard columns"""
         data = {}
+
+        def clean_extracted_text(text):
+            """Remove commerce-only boilerplate and keep visible medical content."""
+            if not text:
+                return ''
+
+            cleaned = str(text).replace('\xa0', ' ').strip()
+
+            # Keep content from first meaningful medical section if commerce banners appear first.
+            section_anchors = [
+                'Product introduction',
+                'Uses of ',
+                'Benefits of ',
+                'Side effects of ',
+                'How to use ',
+                'How ',
+                'Quick tips',
+                'Fact Box',
+                'User Feedback',
+                'FAQs',
+                'Description',
+            ]
+            anchor_positions = [cleaned.find(anchor) for anchor in section_anchors if cleaned.find(anchor) > 0]
+            if anchor_positions:
+                anchor_pos = min(anchor_positions)
+                if anchor_pos > 80:
+                    cleaned = cleaned[anchor_pos:]
+
+            # Remove repetitive non-medical marketplace snippets.
+            noisy_chunks = [
+                'Save more with additional offers',
+                'Assured up to',
+                'Earn cashback',
+                'Use Code',
+                'Buy nowADD',
+                'Get cashback up to',
+                'Get upto Rs.',
+                'Welcome Gift | For First Order',
+                'The content is shown in English',
+                'Why we need a prescription?',
+                'Show moreShow less',
+            ]
+            for marker in noisy_chunks:
+                cleaned = cleaned.replace(marker, ' ')
+
+            # Normalize repeated spaces/newlines created by marker stripping.
+            cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip()
+            return cleaned
+
+        def looks_like_noisy_ecommerce_text(text):
+            """Detect if extracted text is mostly pricing/offers rather than drug details."""
+            if not text:
+                return True
+
+            lower = text.lower()
+            noise_markers = [
+                'cashback',
+                'use code',
+                'buy now',
+                'add to cart',
+                'offers',
+                'sold out',
+                'mrp',
+                '₹',
+            ]
+            medical_markers = [
+                'product introduction',
+                'uses of',
+                'benefits of',
+                'side effects',
+                'how to use',
+                'how ',
+                'quick tips',
+                'treatment of',
+                'consult your doctor',
+            ]
+
+            noise_hits = sum(1 for marker in noise_markers if marker in lower)
+            medical_hits = sum(1 for marker in medical_markers if marker in lower)
+            return noise_hits >= 3 and medical_hits == 0
         
         # Basic meta info
         data['title'] = selector.xpath('normalize-space(//h1)').get() or \
@@ -1223,7 +1430,9 @@ class DrugSpider(scrapy.Spider):
                         break
                 text = sibling.xpath('normalize-space()').get()
                 if text and len(text) > 20:
-                    content_parts.append(text)
+                    cleaned_text = clean_extracted_text(text)
+                    if cleaned_text and not looks_like_noisy_ecommerce_text(cleaned_text):
+                        content_parts.append(cleaned_text)
                 if len('\n'.join(content_parts)) > 10000:
                     break
 
@@ -1278,6 +1487,16 @@ class DrugSpider(scrapy.Spider):
                 # Indian sites
                 '[class*="dosage"]', '[class*="Dosage"]',
                 '.drug-dosage', '.medicine-dosage', '[data-tab="dosage"]',
+            ],
+            'benefits': [
+                '[class*="benefits"]', '[class*="Benefits"]', '[data-tab="benefits"]',
+            ],
+            'how_to_use': [
+                '[class*="how-to-use"]', '[class*="HowToUse"]', '[class*="How_to_use"]',
+                '[data-tab="how-to-use"]', '[data-tab="how_to_use"]',
+            ],
+            'safety_advice': [
+                '[class*="safety"]', '[class*="Safety"]', '[data-tab="safety"]',
             ],
             
             # Safety
@@ -1381,6 +1600,10 @@ class DrugSpider(scrapy.Spider):
                 '[class*="Substitute"]', '[class*="substitute"]', '[data-tab="substitutes"]',
                 '.drug-substitutes', '.alternative-medicines',
             ],
+            'substitutes': [
+                '[class*="Substitute"]', '[class*="substitute"]', '[data-tab="substitutes"]',
+                '.drug-substitutes', '.alternative-medicines',
+            ],
             'manufacturer': [
                 '[class*="Manufacturer"]', '[class*="manufacturer"]',
                 '.drug-manufacturer', '.company-name', '.marketed-by',
@@ -1398,8 +1621,9 @@ class DrugSpider(scrapy.Spider):
                 section = selector.css(sel)
                 if section:
                     text = section.xpath('normalize-space()').get()
-                    if text and len(text) > 50:
-                        return (col_name, text)
+                    cleaned_text = clean_extracted_text(text)
+                    if cleaned_text and len(cleaned_text) > 50 and not looks_like_noisy_ecommerce_text(cleaned_text):
+                        return (col_name, cleaned_text)
             return None
 
         items_to_check = [(col, sels) for col, sels in section_selectors.items() if col not in data]
@@ -1567,7 +1791,7 @@ class DrugSpider(scrapy.Spider):
                 
         # 5. Create Full Summary
         content_parts = []
-        for key in ['description', 'overview', 'uses', 'side_effects', 'dosage', 'warnings', 'quick_tips', 'fact_box', 'patient_concerns', 'user_feedback', 'faqs']:
+        for key in ['description', 'overview', 'uses', 'benefits', 'side_effects', 'dosage', 'how_to_use', 'warnings', 'quick_tips', 'safety_advice', 'fact_box', 'patient_concerns', 'user_feedback', 'faqs', 'substitutes', 'price']:
             if flat_data.get(key):
                 content_parts.append(f"## {key.replace('_', ' ').title()}\n{flat_data[key]}")
         flat_data['full_content'] = '\n\n'.join(content_parts) if content_parts else ''
@@ -1603,15 +1827,18 @@ class DrugSpider(scrapy.Spider):
         """Handle request errors with backtracking"""
         request = failure.request
         url = request.url
+        failure_key = self._failure_key(url)
         
         # Track failures
-        self.failed_urls[url] = self.failed_urls.get(url, 0) + 1
-        self.logger.error(f" Error on {url} (attempt {self.failed_urls[url]}/{self.max_retries_per_link}): {failure.value}")
+        self.failed_urls[failure_key] = self.failed_urls.get(failure_key, 0) + 1
+        self.logger.error(
+            f" Error on {url} (attempt {self.failed_urls[failure_key]}/{self.max_failures_per_normalized_url}): {failure.value}"
+        )
         
         # If max retries reached, add to global visited
-        if self.failed_urls[url] >= self.max_retries_per_link:
+        if self.failed_urls[failure_key] >= self.max_failures_per_normalized_url:
             self.global_visited.add(url)
-            self.logger.warning(f"🔙 Skipping {url} after {self.max_retries_per_link} failures")
+            self.logger.warning(f"🔙 Skipping {url} after {self.max_failures_per_normalized_url} failures")
     
     def handle_http_error(self, failure):
         """Handle HTTP error - fallback to Playwright"""
@@ -1620,7 +1847,7 @@ class DrugSpider(scrapy.Spider):
         meta = request.meta.copy()
         
         # Check if we should retry with Playwright (only if Playwright is available)
-        if PLAYWRIGHT_AVAILABLE and meta.get('retry_with_playwright') and not meta.get('used_playwright'):
+        if self._should_attempt_playwright(url, meta):
             self.logger.warning(f"HTTP failed for {url} - retrying with Playwright")
             
             # Mark as using playwright
@@ -1631,6 +1858,7 @@ class DrugSpider(scrapy.Spider):
             ]
             meta['used_playwright'] = True
             meta['retry_with_playwright'] = False
+            self.playwright_fallbacks_used += 1
             
             yield scrapy.Request(
                 url,
@@ -1642,10 +1870,11 @@ class DrugSpider(scrapy.Spider):
             )
         else:
             # Track as failed
-            self.failed_urls[url] = self.failed_urls.get(url, 0) + 1
+            failure_key = self._failure_key(url)
+            self.failed_urls[failure_key] = self.failed_urls.get(failure_key, 0) + 1
             self.logger.error(f" Error on {url}: {failure.value}")
             
-            if self.failed_urls[url] >= self.max_retries_per_link:
+            if self.failed_urls[failure_key] >= self.max_failures_per_normalized_url:
                 self.global_visited.add(url)
 
     def closed(self, reason):

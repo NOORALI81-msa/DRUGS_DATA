@@ -2,7 +2,7 @@
 __pycache__/
 *.py[cod]
 *.pyo
-
+geometric_crawler/spiders/__pycache__/drug_spider.cpython-314.pyc
 # Virtual environment
 .venv/
 
@@ -30,3 +30,8 @@ crawler_log_*.txt
 *.egg-info/
 dist/
 build/
+inspect_mongo.py
+monitor_mongo_realtime.py
+query_mongo.py 
+view_drugs.py
+check_fields_mongo.py
