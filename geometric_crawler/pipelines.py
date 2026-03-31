@@ -22,6 +22,7 @@ import sys
 import atexit
 import signal
 import re
+from typing import Any
 from datetime import datetime
 from pathlib import Path
 from scrapy.exceptions import DropItem
@@ -175,6 +176,68 @@ class MongoPipeline:
         self.collection = None
         self.count = 0
 
+    @staticmethod
+    def _norm(value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+    @classmethod
+    def _collect_search_terms(cls, doc: dict) -> list[str]:
+        data = doc.get("data") if isinstance(doc.get("data"), dict) else {}
+        candidates = [
+            doc.get("brand_name"),
+            doc.get("drug_name"),
+            doc.get("generic_name"),
+            doc.get("salt"),
+            doc.get("title"),
+            doc.get("site_domain"),
+            data.get("brand_name"),
+            data.get("drug_name"),
+            data.get("generic_name"),
+            data.get("salt"),
+            data.get("title"),
+        ]
+
+        terms = []
+        seen = set()
+        for value in candidates:
+            normalized = cls._norm(value)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            terms.append(normalized)
+        return terms
+
+    def _ensure_collection_indexes(self):
+        if self.collection is None:
+            return
+
+        # Core metadata indexes for operational and recency queries.
+        self.collection.create_index(
+            [
+                ("spider_name", 1),
+                ("site_domain", 1),
+                ("run_number", 1),
+                ("url", 1),
+            ],
+            background=True,
+        )
+        self.collection.create_index([("stored_at", -1)], background=True)
+        self.collection.create_index([("scraped_at", -1)], background=True)
+        self.collection.create_index([("site_domain", 1), ("stored_at", -1)], background=True)
+
+        # Query-focused indexes used by drug_database_search_api.py.
+        self.collection.create_index([("searchable_terms_lc", 1)], background=True)
+        self.collection.create_index([("brand_name_lc", 1), ("stored_at", -1)], background=True)
+        self.collection.create_index([("drug_name_lc", 1), ("stored_at", -1)], background=True)
+        self.collection.create_index([("generic_name_lc", 1), ("stored_at", -1)], background=True)
+        self.collection.create_index([("salt_lc", 1), ("stored_at", -1)], background=True)
+        self.collection.create_index([("title_lc", 1), ("stored_at", -1)], background=True)
+        self.collection.create_index([("data_brand_name_lc", 1), ("stored_at", -1)], background=True)
+        self.collection.create_index([("data_drug_name_lc", 1), ("stored_at", -1)], background=True)
+        self.collection.create_index([("data_generic_name_lc", 1), ("stored_at", -1)], background=True)
+        self.collection.create_index([("data_salt_lc", 1), ("stored_at", -1)], background=True)
+        self.collection.create_index([("data_title_lc", 1), ("stored_at", -1)], background=True)
+
     def open_spider(self, spider):
         self.enabled = bool(self.settings.getbool("MONGO_ENABLED", True))
         if not self.enabled:
@@ -200,14 +263,7 @@ class MongoPipeline:
             self.client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
             self.client.admin.command("ping")
             self.collection = self.client[mongo_db][mongo_collection]
-            self.collection.create_index(
-                [
-                    ("spider_name", 1),
-                    ("site_domain", 1),
-                    ("run_number", 1),
-                    ("url", 1),
-                ]
-            )
+            self._ensure_collection_indexes()
             spider.logger.info(
                 "Mongo output enabled: %s/%s (spider=%s, domain=%s, run=%s)",
                 mongo_db,
@@ -233,9 +289,23 @@ class MongoPipeline:
         doc["run_number"] = self.run_number
         doc["stored_at"] = datetime.utcnow()
 
+        data = doc.get("data") if isinstance(doc.get("data"), dict) else {}
+        doc["brand_name_lc"] = self._norm(doc.get("brand_name"))
+        doc["drug_name_lc"] = self._norm(doc.get("drug_name"))
+        doc["generic_name_lc"] = self._norm(doc.get("generic_name"))
+        doc["salt_lc"] = self._norm(doc.get("salt"))
+        doc["title_lc"] = self._norm(doc.get("title"))
+        doc["data_brand_name_lc"] = self._norm(data.get("brand_name"))
+        doc["data_drug_name_lc"] = self._norm(data.get("drug_name"))
+        doc["data_generic_name_lc"] = self._norm(data.get("generic_name"))
+        doc["data_salt_lc"] = self._norm(data.get("salt"))
+        doc["data_title_lc"] = self._norm(data.get("title"))
+        doc["searchable_terms_lc"] = self._collect_search_terms(doc)
+
         try:
             self.collection.insert_one(doc)
             self.count += 1
+            spider.logger.info(f"Mongo saved item {self.count}")
         except Exception as exc:
             spider.logger.warning(f"Mongo insert failed: {exc}")
 

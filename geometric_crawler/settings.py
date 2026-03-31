@@ -27,14 +27,14 @@ DOWNLOAD_DELAY = Config.DOWNLOAD_DELAY
 RANDOMIZE_DOWNLOAD_DELAY = True
 
 # AutoThrottle - balanced for speed while avoiding bans
-AUTOTHROTTLE_ENABLED = True
-AUTOTHROTTLE_START_DELAY = 0.25
-AUTOTHROTTLE_MAX_DELAY = 3.0
+AUTOTHROTTLE_ENABLED = False  # Disabled for maximum speed, can be enabled if needed
+AUTOTHROTTLE_START_DELAY = 0.5
+AUTOTHROTTLE_MAX_DELAY = 1.0
 AUTOTHROTTLE_TARGET_CONCURRENCY = 8.0
 
 # Connection optimization
 DNS_TIMEOUT = 15
-DOWNLOAD_TIMEOUT = 30
+DOWNLOAD_TIMEOUT = 12
 DOWNLOAD_MAXSIZE = 10485760  # 10MB max
 DOWNLOAD_WARNSIZE = 5242880  # Warn at 5MB
 
@@ -45,8 +45,8 @@ TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
 ASYNCIO_EVENT_LOOP = "asyncio.SelectorEventLoop"
 
 DOWNLOAD_HANDLERS = {
-    "http": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
-    "https": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
+    "http": "scrapy.core.downloader.handlers.http.HTTPDownloadHandler",
+    "https": "scrapy.core.downloader.handlers.http.HTTPDownloadHandler",
 }
 
 PLAYWRIGHT_LAUNCH_OPTIONS = {
@@ -113,4 +113,4 @@ LOG_FORMAT = '%(asctime)s [%(name)s] %(levelname)s: %(message)s'
 # RETRY SETTINGS
 # ============================================================
 RETRY_TIMES = 3
-RETRY_HTTP_CODES = [500, 502, 503, 504, 400, 403, 404, 408, 429]
+RETRY_HTTP_CODES = [500, 502, 503, 504, 400]

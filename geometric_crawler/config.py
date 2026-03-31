@@ -22,7 +22,7 @@ class Config:
     ENABLE_USER_AGENT_ROTATION = os.getenv('ENABLE_USER_AGENT_ROTATION', 'true').lower() == 'true'
     ENABLE_PROXY_ROTATION = False
     ENABLE_REQUEST_SIGNING = os.getenv('ENABLE_REQUEST_SIGNING', 'true').lower() == 'true'
-    ENABLE_RANDOM_DELAY = os.getenv('ENABLE_RANDOM_DELAY', 'true').lower() == 'true'
+    ENABLE_RANDOM_DELAY = os.getenv('ENABLE_RANDOM_DELAY', 'false').lower() == 'true'
     ENABLE_FINGERPRINTING = os.getenv('ENABLE_FINGERPRINTING', 'true').lower() == 'true'
     ENABLE_COOKIE_ROTATION = os.getenv('ENABLE_COOKIE_ROTATION', 'true').lower() == 'true'
     ENABLE_RETRY_MECHANISM = os.getenv('ENABLE_RETRY_MECHANISM', 'true').lower() == 'true'

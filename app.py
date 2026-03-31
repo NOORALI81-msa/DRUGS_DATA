@@ -30,9 +30,9 @@ st.markdown(
     <style>
     /* Make main container full width */
     .main .block-container {
-        max-width: 100000vw !important;
-        padding-left: 2vw;
-        padding-right: 2vw;
+        max-width: 80% !important;
+        padding-left: 0;
+        padding-right: 0;
     }
     /*Make sidebar scrollable and fit */
     section[data-testid="stSidebar"] > div {
@@ -719,6 +719,31 @@ def run_spider(cmd: list, output_queue: queue.Queue, extra_env: dict = None):
     started_monotonic = time.time()
     request_count = 0
     item_count = 0
+    mongo_saved_this_run = 0
+    mongo_collection_total = None
+    mongo_db_name = None
+    mongo_collection_name = None
+
+    def _refresh_mongo_collection_total():
+        nonlocal mongo_collection_total
+        db_name = mongo_db_name or os.environ.get("MONGO_DATABASE", "geometric_crawler")
+        collection_name = mongo_collection_name or os.environ.get("MONGO_COLLECTION", "spider_items")
+        mongo_uri = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
+
+        if extra_env:
+            db_name = extra_env.get("MONGO_DATABASE", db_name)
+            collection_name = extra_env.get("MONGO_COLLECTION", collection_name)
+            mongo_uri = extra_env.get("MONGO_URI", mongo_uri)
+
+        try:
+            from pymongo import MongoClient
+            client = MongoClient(mongo_uri, serverSelectionTimeoutMS=2500, connectTimeoutMS=2500)
+            client.admin.command("ping")
+            mongo_collection_total = client[db_name][collection_name].count_documents({})
+            client.close()
+        except Exception:
+            # Keep benchmark logging resilient even if Mongo is unreachable.
+            pass
 
     def _write_benchmark_snapshot(prefix: str = "Benchmark"):
         if not log_file:
@@ -726,11 +751,26 @@ def run_spider(cmd: list, output_queue: queue.Queue, extra_env: dict = None):
         elapsed = max(0.0, time.time() - started_monotonic)
         avg_req = (request_count / elapsed) if elapsed > 0 else 0.0
         avg_items = (item_count / elapsed) if elapsed > 0 else 0.0
+        mongo_total_text = str(mongo_collection_total) if isinstance(mongo_collection_total, int) else "n/a"
         log_file.write(
             f"{prefix}: requests_done={request_count}, items={item_count}, "
             f"avg_req_speed={avg_req:.2f}/s, avg_extract_speed={avg_items:.2f}/s, "
-            f"elapsed={elapsed:.1f}s\n"
+            f"elapsed={elapsed:.1f}s, mongo_saved_run={mongo_saved_this_run}, "
+            f"mongo_collection_total={mongo_total_text}\n"
         )
+        log_file.flush()
+
+    def _write_ll_atats_block():
+        # Always print this as the very last block in the log
+        log_file.write("\n" + "=" * 70 + "\n")
+        log_file.write("LL ATATS\n")
+        log_file.write(f"Output file: {live_log_path}\n")
+        log_file.write(f"Items saved: {mongo_saved_this_run}\n")
+        log_file.write(f"Mongo collection total: {mongo_collection_total if mongo_collection_total is not None else 'n/a'}\n")
+        log_file.write(f"Benchmark items: {item_count}\n")
+        log_file.write(f"Exit code: {process.returncode if 'process' in locals() and process else 'n/a'}\n")
+        log_file.write(f"Finished: {datetime.now().isoformat()}\n")
+        log_file.write("=" * 70 + "\n")
         log_file.flush()
 
     try:
@@ -787,6 +827,15 @@ def run_spider(cmd: list, output_queue: queue.Queue, extra_env: dict = None):
             if m_item:
                 item_count = max(item_count, int(m_item.group(1)))
 
+            m_mongo_done = re.search(r"Mongo done:\s*(\d+)\s+items saved", line_text)
+            if m_mongo_done:
+                mongo_saved_this_run = max(mongo_saved_this_run, int(m_mongo_done.group(1)))
+
+            m_mongo_enabled = re.search(r"Mongo output enabled:\s*([^/]+)/([^\s]+)", line_text)
+            if m_mongo_enabled:
+                mongo_db_name = m_mongo_enabled.group(1)
+                mongo_collection_name = m_mongo_enabled.group(2)
+
             if log_file:
                 log_file.write(line_text + "\n")
                 log_file.flush()
@@ -797,27 +846,33 @@ def run_spider(cmd: list, output_queue: queue.Queue, extra_env: dict = None):
         process.wait()
 
         if log_file:
+            _refresh_mongo_collection_total()
             log_file.write("=" * 80 + "\n")
             _write_benchmark_snapshot(prefix="Benchmark (final)")
             log_file.write(f"Exit code: {process.returncode}\n")
             log_file.write(f"Finished: {datetime.now().isoformat()}\n")
+            _write_ll_atats_block()
             log_file.flush()
 
         output_queue.put(f"__EXIT_CODE_{process.returncode}__")
     except KeyboardInterrupt:
         if log_file:
+            _refresh_mongo_collection_total()
             log_file.write("=" * 80 + "\n")
             _write_benchmark_snapshot(prefix="Benchmark (interrupted)")
             log_file.write(f"Runner interrupted by user (Ctrl+C)\n")
             log_file.write(f"Finished: {datetime.now().isoformat()}\n")
+            _write_ll_atats_block()
             log_file.flush()
         output_queue.put("__INTERRUPTED__")
     except Exception as e:
         if log_file:
+            _refresh_mongo_collection_total()
             log_file.write("=" * 80 + "\n")
             _write_benchmark_snapshot(prefix="Benchmark (interrupted)")
             log_file.write(f"Runner error: {str(e)}\n")
             log_file.write(f"Finished: {datetime.now().isoformat()}\n")
+            _write_ll_atats_block()
             log_file.flush()
         output_queue.put(f"__ERROR__{str(e)}__")
     finally:
@@ -925,8 +980,9 @@ def render_runtime_metrics(metrics: dict):
     elapsed = metrics.get("elapsed_seconds", 0.0)
     avg_req = metrics.get("avg_req_per_sec")
     avg_items = metrics.get("avg_items_per_sec")
+    mongo_saved = metrics.get("mongo_saved_this_run")
 
-    if req is None and items is None:
+    if req is None and items is None and mongo_saved is None:
         st.caption("Benchmark metrics unavailable from logs for this run.")
         return
 
@@ -934,6 +990,11 @@ def render_runtime_metrics(metrics: dict):
     items_text = str(items) if items is not None else "n/a"
     avg_req_text = f"{avg_req:.2f}/s" if avg_req is not None else "n/a"
     avg_items_text = f"{avg_items:.2f}/s" if avg_items is not None else "n/a"
+
+    # Show MongoDB count if present and output_format is mongo
+    output_format = st.session_state.get("output_format", "json")
+    if output_format == "mongo" and mongo_saved is not None:
+        st.success(f"MongoDB: {mongo_saved} items saved.")
     st.info(
         f"Benchmark summary: requests done={req_text}, items={items_text}, "
         f"avg request speed={avg_req_text}, avg extraction speed={avg_items_text}, "
@@ -1077,7 +1138,7 @@ with st.sidebar:
     
     output_format = st.selectbox(
         "Output Format",
-        options=["json", "jsonl", "csv"],
+        options=["json", "jsonl", "csv", "mongo"],
         index=0
     )
     

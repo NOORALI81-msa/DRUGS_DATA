@@ -100,7 +100,7 @@ class DrugSpider(scrapy.Spider):
         'geriatric_dosage': ['geriatric dose', 'geriatric dosage', 'elderly', 'older adults', 'geriatric use'],
         'renal_dosing': ['renal dose', 'renal impairment', 'kidney', 'renal adjustment', 'creatinine clearance'],
         'hepatic_dosing': ['hepatic dose', 'hepatic impairment', 'liver', 'hepatic adjustment', 'cirrhosis'],
-        'route_of_administration': ['route', 'administration route', 'oral', 'intravenous', 'iv', 'im', 'subcutaneous'],
+        'route_of_administration': ['route of administration', 'administration route', 'routes of administration'],
         
         # === PHARMACOKINETICS (ADME) ===
         'pharmacokinetics': ['pharmacokinetics', 'pk', 'adme'],
@@ -1352,6 +1352,12 @@ class DrugSpider(scrapy.Spider):
                 'sold out',
                 'mrp',
                 '₹',
+                'rs.',
+                'save up to',
+                'get upto',
+                'payment options',
+                'delivery in',
+                'pay',
             ]
             medical_markers = [
                 'product introduction',
@@ -1631,6 +1637,78 @@ class DrugSpider(scrapy.Spider):
         for result in selector_results:
             if result:
                 data[result[0]] = result[1]
+
+        # 1mg-specific interaction extraction: keep both visible text and interaction links.
+        if self._is_1mg_domain(url):
+            interaction_links = []
+            for anchor in selector.css('a[href*="interaction"]'):
+                href = (anchor.attrib.get('href') or '').strip()
+                if not href:
+                    continue
+
+                full_url = urljoin(url, href)
+                parsed = urlparse(full_url)
+                path_lower = parsed.path.lower()
+
+                if '1mg.com' not in parsed.netloc.lower():
+                    continue
+                if '/drug-interactions/' not in path_lower and 'interaction' not in path_lower:
+                    continue
+
+                link_text = anchor.xpath('normalize-space()').get() or ''
+                link_text = re.sub(r'\s+', ' ', link_text).strip()
+                if not link_text:
+                    link_text = path_lower.rstrip('/').split('/')[-1].replace('-', ' ').strip()
+
+                # Skip CTA/noise links that are not actual interaction entries.
+                text_l = link_text.lower()
+                if text_l in {'add', 'check', 'medicine interaction checker'}:
+                    continue
+                if len(link_text) < 2:
+                    continue
+
+                interaction_links.append((link_text, full_url))
+
+            deduped_links = []
+            seen_link_urls = set()
+            for name, link in interaction_links:
+                key = link.lower().strip()
+                if key in seen_link_urls:
+                    continue
+                seen_link_urls.add(key)
+                deduped_links.append((name, link))
+
+            if deduped_links:
+                link_lines = [f"{name}: {link}" for name, link in deduped_links]
+                existing = (data.get('drug_interactions') or '').strip()
+                links_text = "Interaction links:\n" + "\n".join(link_lines)
+                data['drug_interactions'] = f"{existing}\n\n{links_text}".strip() if existing else links_text
+
+        # Guard against bad route mapping (e.g., accidental capture from unrelated sections).
+        route_text = (data.get('route_of_administration') or '').strip()
+        if route_text:
+            route_l = route_text.lower()
+            route_markers = [
+                'route of administration',
+                'administered',
+                'oral',
+                'intravenous',
+                'intramuscular',
+                'subcutaneous',
+                'topical',
+                'inhalation',
+            ]
+            invalid_markers = [
+                'view all substitutes',
+                'substitute',
+                'medicine interaction checker',
+                'add two medicines',
+                'click here',
+            ]
+            has_route_signal = any(marker in route_l for marker in route_markers)
+            has_invalid_signal = any(marker in route_l for marker in invalid_markers)
+            if has_invalid_signal or not has_route_signal:
+                data.pop('route_of_administration', None)
         
         return data
     

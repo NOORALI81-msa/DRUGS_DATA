@@ -16,6 +16,18 @@ LOCAL_DB_PATH = "drug_search.db"
 MONGO_URI = "mongodb://localhost:27017"
 MONGO_DATABASE = "geometric_crawler"
 MONGO_COLLECTION = "spider_items"
+MONGO_INDEXED_LC_FIELDS = [
+    "brand_name_lc",
+    "drug_name_lc",
+    "generic_name_lc",
+    "salt_lc",
+    "title_lc",
+    "data_brand_name_lc",
+    "data_drug_name_lc",
+    "data_generic_name_lc",
+    "data_salt_lc",
+    "data_title_lc",
+]
 INDIAN_SOURCE_HINTS = (
     "pharmeasy",
     "1mg",
@@ -614,16 +626,50 @@ def search_mongo_database(query, generic, brand_names):
         ]
     }
 
+    projection = {
+        "brand_name": 1,
+        "drug_name": 1,
+        "generic_name": 1,
+        "salt": 1,
+        "title": 1,
+        "site_domain": 1,
+        "domain": 1,
+        "url": 1,
+        "strength": 1,
+        "form": 1,
+        "data": 1,
+    }
+
+    exact_or_filter = [{"searchable_terms_lc": {"$in": normalized_terms}}]
+    exact_or_filter.extend({field: {"$in": normalized_terms}} for field in MONGO_INDEXED_LC_FIELDS)
+    indexed_exact_filter = {"$or": exact_or_filter}
+
+    prefix_term = normalized_terms[0] if normalized_terms else ""
+    indexed_prefix_filter = None
+    if prefix_term:
+        prefix_pattern = f"^{re.escape(prefix_term)}"
+        prefix_or_filter = [{"searchable_terms_lc": {"$regex": prefix_pattern}}]
+        prefix_or_filter.extend({field: {"$regex": prefix_pattern}} for field in MONGO_INDEXED_LC_FIELDS)
+        indexed_prefix_filter = {"$or": prefix_or_filter}
+
     client = None
     try:
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=4000)
         collection = client[MONGO_DATABASE][MONGO_COLLECTION]
-        # First, try indexed/targeted matching on common fields.
-        matched_docs = list(collection.find(query_filter).sort("_id", -1).limit(1000))
+        # Step 1: exact search on normalized fields backed by indexes.
+        matched_docs = list(collection.find(indexed_exact_filter, projection).sort("_id", -1).limit(1000))
+
+        # Step 2: anchored prefix search on normalized fields.
+        if not matched_docs and indexed_prefix_filter:
+            matched_docs = list(collection.find(indexed_prefix_filter, projection).sort("_id", -1).limit(1000))
+
+        # Step 3: broad regex search fallback for older data without normalized fields.
+        if not matched_docs:
+            matched_docs = list(collection.find(query_filter, projection).sort("_id", -1).limit(1000))
 
         # Fallback: if nothing found, scan recent docs and match keyword in full stored content.
         if not matched_docs:
-            scan_cursor = collection.find({}).sort("_id", -1).limit(3000)
+            scan_cursor = collection.find({}, projection).sort("_id", -1).limit(3000)
             for doc in scan_cursor:
                 blob = _doc_text_blob(doc)
                 if any(t in blob for t in normalized_terms):
@@ -749,6 +795,57 @@ def _extract_brand_name(product_name, generic_name):
     return cleaned
 
 
+def _query_tokens(query):
+    q = _norm(query)
+    if not q:
+        return []
+    return [tok for tok in q.split(" ") if len(tok) >= 2]
+
+
+def _row_search_blob(row):
+    parts = [
+        row.get("brand_name"),
+        row.get("generic_name"),
+        row.get("salt"),
+        row.get("strength"),
+        row.get("form"),
+        row.get("source_site"),
+        row.get("source_url"),
+    ]
+
+    for s in row.get("source_urls", []):
+        if isinstance(s, dict):
+            parts.append(s.get("site"))
+            parts.append(s.get("url"))
+
+    return _norm(" ".join(str(p) for p in parts if p))
+
+
+def _row_match_tier(row, query):
+    """Return 3 (exact phrase), 2 (all tokens), 1 (any token), 0 (irrelevant)."""
+    qn = _norm(query)
+    if not qn:
+        return 0
+
+    blob = _row_search_blob(row)
+    if not blob:
+        return 0
+
+    if qn in blob:
+        return 3
+
+    tokens = _query_tokens(query)
+    if not tokens:
+        return 0
+
+    token_hits = sum(1 for t in tokens if t in blob)
+    if token_hits == len(tokens):
+        return 2
+    if token_hits > 0:
+        return 1
+    return 0
+
+
 def _score_row(row, query, generic):
     b = _norm(row.get("brand_name"))
     q = _norm(query)
@@ -858,6 +955,18 @@ def search_variants_from_databases(query):
     ]
     removed_count = len(all_rows) - len(filtered)
 
+    # Keep only highly related rows first (exact phrase, then all query tokens).
+    exact_rows = [r for r in filtered if _row_match_tier(r, q) == 3]
+    all_token_rows = [r for r in filtered if _row_match_tier(r, q) == 2]
+    partial_rows = [r for r in filtered if _row_match_tier(r, q) == 1]
+
+    if exact_rows:
+        filtered = exact_rows
+    elif all_token_rows:
+        filtered = all_token_rows
+    elif partial_rows:
+        filtered = partial_rows
+
     filtered.sort(key=lambda r: (-_score_row(r, q, generic), _norm(r.get("brand_name"))))
 
     indian_only = [r for r in filtered if _is_indian_source(r.get("source_site", ""))]
@@ -889,27 +998,53 @@ def search_variants_from_databases(query):
             "salt": row.get("salt", "") or row.get("generic_name", ""),
             "strength": row.get("strength", ""),
             "form": row.get("form", ""),
+            "match_tier": _row_match_tier(row, q),
             "source_urls": _dedupe_source_urls(row.get("source_urls", [])),
             "data_sections": row.get("data_sections", []),
         })
 
-    return qtype, generic, response_rows, removed_count, all_data_sections
+    response_data_sections = []
+    for row in response_rows:
+        response_data_sections.extend(row.get("data_sections", []))
+    response_data_sections = _dedupe_data_sections(response_data_sections)
+
+    return qtype, generic, response_rows, removed_count, response_data_sections
 
 
 # ---------------------------------------------------------
 # API
 # ---------------------------------------------------------
 
+
 @app.route("/api/search-database")
 def api_search_database():
+
+    # Require X-Auth-Keyword header to be 'drug_data'
+    auth_keyword = request.headers.get("X-Auth-Keyword", "").strip()
+    if auth_keyword != "drug_data":
+        return jsonify({"error": "Unauthorized: invalid or missing X-Auth-Keyword header. Use the value."}), 401
+
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify({"error": "missing query. Use /api/search-database?q=pantoprazole"}), 400
 
-    _, _, _, _, all_data_sections = search_variants_from_databases(q)
+    qtype, generic, variants, removed_count, all_data_sections = search_variants_from_databases(q)
+
+    source_counts = Counter()
+    for row in variants:
+        for src in row.get("source_urls", []):
+            site = (src or {}).get("site", "")
+            if site:
+                source_counts[site] += 1
 
     return jsonify({
         "query": q,
+        "query_type": qtype,
+        "generic_name": generic,
+        "variants_count": len(variants),
+        "removed_count": removed_count,
+        "variants": variants,
+        "sources": [{"site": k, "count": v} for k, v in source_counts.most_common()],
         "total_found": len(all_data_sections),
         "data": all_data_sections,
     })
@@ -922,5 +1057,6 @@ def home():
 
 if __name__ == "__main__":
     print("Server running at http://localhost:5001")
-    print("API: http://localhost:5001/api/search-database?q=pantoprazole")
+    print("API: http://localhost:5001/api/search-database?q=")
     app.run(port=5001, debug=True)
+    
