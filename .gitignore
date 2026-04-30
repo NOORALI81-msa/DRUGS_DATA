@@ -36,3 +36,5 @@ query_mongo.py
 view_drugs.py
 check_fields_mongo.py
 site_extractor.py
+spider_generator.py
+drug_search_api.py
