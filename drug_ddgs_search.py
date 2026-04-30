@@ -5,11 +5,12 @@ import sqlite3
 import requests
 import concurrent.futures
 from urllib.parse import quote_plus, urlparse
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from ddgs import DDGS
 from selectolax.parser import HTMLParser
 
 app = Flask(__name__)
+app.json.sort_keys = False
 
 # ---------------------------------------------------------
 # Config
@@ -110,6 +111,10 @@ FORM_ALIASES = {
     "suspension": "Suspension",
     "spray": "Spray",
     "infusion": "Injection",
+}
+
+BAD_BRAND_TOKENS = {
+    "store", "medicine", "medicines", "healthcare", "home", "offers", "cart", "search"
 }
 
 
@@ -388,6 +393,389 @@ def _extract_from_embedded_json(html_text, fallback_generic):
     return ""
 
 
+DETAIL_SECTION_SPECS = [
+    ("titles", "Title", [r"\btitle\b", r"\bproduct\s*title\b", r"\bmedicine\s*title\b"]),
+    ("introductions", "Introduction", [r"\bintroduction\b", r"\bproduct introduction\b", r"\boverview\b"]),
+    ("descriptions", "Description", [r"\bdescription\b", r"\babout\b", r"\bwhat is\b"]),
+    ("indications", "Indications", [r"\bindications\b", r"\bused for\b", r"\buses of\b", r"\buses\b"]),
+    ("benefits", "Benefits", [r"\bbenefits\b", r"\bkey benefits\b"]),
+    ("ingredients", "Ingredients", [r"\bingredients\b", r"\bcomposition\b", r"\bsalt composition\b", r"\bactive ingredient\b"]),
+    ("mechanisms", "Mechanism", [r"\bmechanism\b", r"\bmechanism of action\b", r"\bhow it works\b", r"\bhow .* works\b"]),
+    ("pharmacokinetics", "Pharmacokinetics", [r"\bpharmacokinetics\b", r"\bkinetics\b", r"\bpk\b"]),
+    ("pharmacodynamics", "Pharmacodynamics", [r"\bpharmacodynamics\b", r"\bdynamics\b", r"\bpd\b"]),
+    ("dosage", "Dosage", [r"\bdosage\b", r"\bdose\b", r"\bposology\b"]),
+    ("adult_dosage", "Adult dosage", [r"\badult dosage\b", r"\bdosage for adults\b"]),
+    ("pediatric_dosage", "Pediatric dosage", [r"\bpediatric dosage\b", r"\bpaediatric dosage\b", r"\bdosage for children\b", r"\bchildren dosage\b"]),
+    ("geriatric_dosage", "Geriatric dosage", [r"\bgeriatric dosage\b", r"\bdosage for elderly\b", r"\belderly dosage\b"]),
+    ("dosage_form", "Dosage form", [r"\bdosage form\b", r"\bform\b", r"\bavailable forms\b"]),
+    ("administration", "Administration", [r"\badministration\b", r"\bhow to use\b", r"\bdirection for use\b", r"\bhow to take\b"]),
+    ("side_effects", "Side effects", [r"\bside effects\b", r"\bcommon side effects\b"]),
+    ("adverse_effects", "Adverse effects", [r"\badverse effects\b", r"\badverse reactions\b"]),
+    ("contraindications", "Contraindications", [r"\bcontraindications\b", r"\bwhen not to use\b", r"\bdo not use\b"]),
+    ("interactions", "Interactions", [r"\binteractions\b", r"\bdrug interactions\b"]),
+    ("food_interactions", "Food interactions", [r"\bfood interactions\b", r"\binteractions with food\b"]),
+    ("drug_interactions", "Drug interactions", [r"\bdrug interactions\b", r"\binteractions with other medicines\b"]),
+    ("precautions", "Precautions", [r"\bprecautions\b", r"\bcareful\b", r"\bcaution\b"]),
+    ("warnings", "Warnings", [r"\bwarnings\b", r"\bwarning\b"]),
+    ("safety_advice", "Safety advice", [r"\bsafety advice\b", r"\bsafety information\b"]),
+    ("pregnancy_concerns", "Pregnancy concerns", [r"\bpregnancy\b", r"\buse in pregnancy\b", r"\bpregnant\b"]),
+    ("pediatric_concerns", "Pediatric concerns", [r"\bpediatric concerns\b", r"\bpaediatric concerns\b", r"\buse in children\b"]),
+    ("storage", "Storage", [r"\bstorage\b", r"\bstore\b", r"\bstoring\b"]),
+    ("tips", "Tips", [r"\btips\b", r"\bquick tips\b", r"\bhelpful tips\b"]),
+    ("fact_boxes", "Fact box", [r"\bfact box\b", r"\bfacts\b", r"\bkey facts\b"]),
+]
+
+ALLOWED_DRUG_DETAIL_KEYS = {
+    "title", "brand_name", "generic_name", "strength", "form", "source_site", "source_url",
+    "titles", "introductions", "descriptions", "indications", "benefits", "ingredients",
+    "mechanisms", "pharmacokinetics", "pharmacodynamics", "dosage", "adult_dosage",
+    "pediatric_dosage", "geriatric_dosage", "dosage_form", "administration", "side_effects",
+    "adverse_effects", "contraindications", "interactions", "food_interactions", "drug_interactions",
+    "precautions", "warnings", "safety_advice", "pregnancy_concerns", "pediatric_concerns",
+    "storage", "tips", "fact_boxes", "sections",
+    "summary",
+}
+
+NOISE_SECTION_MARKERS_RE = re.compile(
+    r"__next_f\.push|og:title|og:description|twitter:|viewport-fit|canonical|application/ld\+json|meta\s+name=|meta\s+property=",
+    re.I,
+)
+
+NAV_NOISE_RE = re.compile(
+    r"express delivery|select pincode|hello,?\s*log in|offers\s+cart|shop by category|"
+    r"must haves|summer store|pet care|top-selling|top-searched|frequently bought together|"
+    r"explore more at pharmeasy|quick links|author details|written by|reviewed by|"
+    r"mrp\s*₹|out of stock|made by|offer applicable",
+    re.I,
+)
+
+MEDICAL_SIGNAL_RE = re.compile(
+    r"pain|inflammation|dose|dosage|tablet|capsule|contraindication|side effect|"
+    r"interaction|warning|precaution|pregnan|child|pediatric|geriatric|storage|"
+    r"active ingredient|composition|mechanism|therapy|analgesic|antipyretic",
+    re.I,
+)
+
+SECTION_TAIL_CUTOFF_RE = re.compile(
+    r"\b(Frequently Asked Questions|FAQs|Articles|Chronic Condition Articles|Vendor Details|"
+    r"In Case of Any Issues|Disclaimer|Did you find this helpful|Explore More at Pharmeasy|"
+    r"Author Details|Written by|Reviewed by|3 Step Quality)\b",
+    re.I,
+)
+
+
+def _trim_section_tail(content):
+    c = (content or "").strip()
+    if not c:
+        return c
+    m = SECTION_TAIL_CUTOFF_RE.search(c)
+    if m:
+        c = c[:m.start()].strip(" :-")
+    return c
+
+
+def _is_high_confidence_section(heading, content, section_key=""):
+    h = (heading or "").strip()
+    c = (content or "").strip()
+    if not h or not c:
+        return False
+
+    # Ignore obvious payload/config/script noise.
+    if NOISE_SECTION_MARKERS_RE.search(h) or NOISE_SECTION_MARKERS_RE.search(c):
+        return False
+
+    if NAV_NOISE_RE.search(c):
+        return False
+
+    if re.search(r"<[^>]+>", c):
+        return False
+
+    # Require enough natural language text.
+    word_count = len(re.findall(r"[A-Za-z]{3,}", c))
+    if word_count < 10:
+        return False
+
+    # Reject mostly symbolic payload text.
+    symbol_count = len(re.findall(r"[\[\]{}\\|]", c))
+    if symbol_count > 40:
+        return False
+
+    # A practical range for section bodies.
+    if len(c) < 50 or len(c) > 2200:
+        return False
+
+    if section_key in {"introductions", "descriptions", "titles"} and not MEDICAL_SIGNAL_RE.search(c):
+        return False
+
+    if section_key == "interactions" and not re.search(r"interaction", c, re.I):
+        return False
+
+    if section_key == "warnings" and not re.search(r"pregnan|breast|driving|alcohol|warning|caution", c, re.I):
+        return False
+
+    return True
+
+
+def _split_into_sections(text, max_sections=60):
+    """Split page text into (heading, content) sections using markdown-style headings.
+    Falls back to a single Overview section when no headings found.
+    """
+    src = (text or "").strip()
+    if not src:
+        return []
+
+    candidates = []
+
+    # 1) Markdown headings: '#', '##', '###'
+    for m in re.finditer(r'(?m)^(#{1,3})\s*(.+)\s*$', src):
+        candidates.append((m.start(), m.end(), m.group(2).strip()))
+
+    # 2) HTML headings: <h1>..</h1>, <h2>..</h2>, <h3>..</h3>
+    for m in re.finditer(r'(?is)<h([1-3])[^>]*>(.*?)</h\1>', src):
+        heading_text = re.sub(r'<[^>]+>', '', m.group(2)).strip()
+        candidates.append((m.start(), m.end(), heading_text))
+
+    # 3) Underlined headings (line followed by === or ---)
+    for m in re.finditer(r'(?m)^([^\r\n]{1,80})\r?\n[=\-]{3,}\r?\n', src):
+        candidates.append((m.start(), m.end(), m.group(1).strip()))
+
+    # 4) Short lines ending with colon (e.g., 'Uses:', 'Side effects:')
+    for m in re.finditer(r'(?m)^[ \t]*([A-Za-z][A-Za-z0-9 &()\-]{0,80}):\s*$', src):
+        candidates.append((m.start(), m.end(), m.group(1).strip()))
+
+    # 5) Lines that contain known keywords (best-effort) as standalone lines
+    keyword_pattern = r'Uses|Side effects|Side-effects|Interactions|How to use|Dosage|Indications|Composition|Contraindications|Precautions|Warnings|Adverse reactions|Overdose|Mechanism of action|Ingredients|Substitutes|Storage|How to take|When not to take'
+    for m in re.finditer(r'(?im)^[ \t]*(.{1,80}(' + keyword_pattern + r').{0,40})\s*$', src):
+        candidates.append((m.start(), m.end(), m.group(1).strip()))
+
+    # Normalize / deduplicate by start index and sort
+    unique = {}
+    for s, e, h in candidates:
+        if s in unique:
+            # prefer longer heading text
+            if len(h) > len(unique[s][1]):
+                unique[s] = (e, h)
+        else:
+            unique[s] = (e, h)
+
+    headers = sorted([(s, v[0], v[1]) for s, v in unique.items()], key=lambda x: x[0])
+
+    if not headers:
+        return [("Overview", src[:20000])]
+
+    sections = []
+    for i, (h_start, h_end, h_text) in enumerate(headers):
+        start = h_end
+        end = headers[i + 1][0] if i + 1 < len(headers) else len(src)
+        content = src[start:end].strip()
+        content = re.sub(r"\s+", " ", content)
+        if len(content) > 20000:
+            content = content[:20000].rstrip() + "..."
+        sections.append((h_text, content))
+        if len(sections) >= max_sections:
+            break
+
+    return sections
+
+
+def _extract_sections_by_markers(text, max_chars=180000):
+    """Fallback extractor for pages where heading structure is collapsed.
+    Scans for known medical section labels and slices text between labels.
+    """
+    src = (text or "")[:max_chars]
+    if not src:
+        return {}
+
+    scan = re.sub(r"\s+", " ", src)
+
+    marker_specs = [
+        ("descriptions", [r"\bmedical description\b", r"\bdescription\b", r"\bproduct summary\b"]),
+        ("indications", [r"\buses\b", r"\bindications\b", r"\bused for\b"]),
+        ("contraindications", [r"\bcontraindications\b"]),
+        ("side_effects", [r"\bside effects\b", r"\badverse effects\b", r"\badverse reactions\b"]),
+        ("precautions", [r"\bprecautions and warnings\b", r"\bprecautions\b"]),
+        ("administration", [r"\bdirections for use\b", r"\bhow to use\b"]),
+        ("storage", [r"\bstorage and disposal\b", r"\bstorage\b"]),
+        ("dosage", [r"\bdosage\b"]),
+        ("mechanisms", [r"\bmode of action\b", r"\bhow does it work\b", r"\bmechanism of action\b"]),
+        ("interactions", [r"\binteractions\b", r"\binteractions with other medicines\b"]),
+    ]
+
+    found = []
+    for key, pats in marker_specs:
+        for pat in pats:
+            for m in re.finditer(pat, scan, re.I):
+                found.append((m.start(), m.end(), key))
+
+    if not found:
+        return {}
+
+    found.sort(key=lambda x: x[0])
+    # dedupe nearby duplicate markers
+    deduped = []
+    for item in found:
+        if deduped and item[2] == deduped[-1][2] and abs(item[0] - deduped[-1][0]) < 30:
+            continue
+        deduped.append(item)
+
+    out = {}
+    for i, (start, end, key) in enumerate(deduped):
+        if key in out:
+            continue
+        next_start = deduped[i + 1][0] if i + 1 < len(deduped) else len(scan)
+        body = scan[end:next_start].strip(" :-")
+        if len(body) > 1800:
+            body = body[:1800].rstrip() + "..."
+        body = _trim_section_tail(body)
+        if not body:
+            continue
+        if not _is_high_confidence_section(key, body, key):
+            continue
+        out[key] = body
+
+    return out
+
+
+def _build_drug_details_block(row):
+    text = (row.get("full_content") or row.get("snippet") or "").strip()
+    def _clean_js_serialized_text(raw):
+        if not raw:
+            return raw
+        s = str(raw)
+        # unescape common sequences
+        s = s.replace('\\n', '\n').replace('\\r', '\n').replace('\\t', ' ')
+        s = s.replace('\\"', '"').replace("\\'", "'")
+        # remove JS-style comment fragments
+        s = re.sub(r'//[^\r\n]*', ' ', s)
+        # remove regex-like escape groups like \b...\b
+        s = re.sub(r'\\b[^\\]*\\b', ' ', s)
+        # remove JSON-like structural tokens and common array markers
+        s = re.sub(r'\[\"?\$\"?,|\],\[|\],|\[|\]', ' ', s)
+        # remove leftover key:value pairs "key":"value"
+        s = re.sub(r'\"[^\"]+\"\s*:\s*\"[^\"]*\"', ' ', s)
+        # strip HTML tags
+        s = re.sub(r'<[^>]+>', ' ', s)
+        # remove stray backslashes and quotes
+        s = s.replace('\\', ' ').replace('\"', ' ').replace('"', ' ').replace("'", ' ')
+        # collapse spaces while preserving line boundaries for heading detection
+        lines = [re.sub(r'[ \t]+', ' ', ln).strip() for ln in s.splitlines()]
+        s = "\n".join([ln for ln in lines if ln]).strip()
+        return s
+    # clean noisy JS/JSON payloads that sometimes get embedded in page text
+    text = _clean_js_serialized_text(text)
+    if not text:
+        return {}
+
+    brand_name = (row.get("brand_name") or "").strip()
+    generic_name = (row.get("generic_name") or "").strip()
+    page_title = (row.get("page_title") or "").strip()
+    page_title = re.sub(r'\\s+', ' ', (page_title or '')).strip()
+
+    details = {
+        "title": page_title or brand_name,
+        "brand_name": brand_name,
+        "generic_name": generic_name,
+        "strength": (row.get("strength") or "").strip(),
+        "form": (row.get("form") or "").strip(),
+        "dosage_form": (row.get("form") or "").strip(),
+        "source_site": (row.get("source_urls") or [{}])[0].get("site", ""),
+        "source_url": (row.get("source_urls") or [{}])[0].get("url", ""),
+        "sections": [],
+    }
+
+    # Seed only stable canonical fields.
+    if details["title"]:
+        details["titles"] = details["title"]
+    if details.get("generic_name"):
+        details["ingredients"] = details["generic_name"]
+
+    # First pass: marker-based extraction works better on collapsed ecommerce pages.
+    marker_sections = _extract_sections_by_markers(text)
+    for key, content in marker_sections.items():
+        title = next((t for k, t, _ in DETAIL_SECTION_SPECS if k == key), key.replace("_", " ").title())
+        details[key] = content
+        # estimate a simple confidence score based on length
+        wc = len(re.findall(r"[A-Za-z]{3,}", content))
+        conf = min(0.99, max(0.45, wc / 200.0))
+        details["sections"].append({"key": key, "title": title, "content": content, "confidence": round(conf, 2)})
+
+    used_keys = {s.get("key") for s in details["sections"]}
+
+    # Second pass: heading-based extraction fills any missing keys.
+    secs = _split_into_sections(text)
+
+    # Map detected sections to our desired detail keys using heading names
+    for heading, content in secs:
+        hlow = (heading or "").lower()
+        assigned = False
+        for key, title, patterns in DETAIL_SECTION_SPECS:
+            if key in used_keys:
+                continue
+            # match heading text against spec patterns (fast)
+            for pat in patterns:
+                try:
+                    if re.search(pat, heading, re.I):
+                        normalized_content = _trim_section_tail(content[:2000].strip())
+                        if not normalized_content:
+                            break
+                        if not _is_high_confidence_section(heading, normalized_content, key):
+                            break
+                        details[key] = normalized_content
+                        wc = len(re.findall(r"[A-Za-z]{3,}", normalized_content))
+                        conf = min(0.99, max(0.45, wc / 200.0))
+                        details["sections"].append({"key": key, "title": title, "content": normalized_content, "confidence": round(conf, 2)})
+                        used_keys.add(key)
+                        assigned = True
+                        break
+                except re.error:
+                    continue
+            if assigned:
+                break
+
+    # Keep sections bounded even when many headings are found.
+    if len(details["sections"]) > 12:
+        details["sections"] = details["sections"][:12]
+
+    if len(details["sections"]) > 12:
+        details["sections"] = details["sections"][:12]
+
+    # Build a short summary from top sections if available.
+    def _make_summary(d):
+        parts = []
+        for k in ("descriptions", "introductions"):
+            if d.get(k):
+                parts.append(d.get(k))
+        if not parts and d.get("sections"):
+            parts.append(d["sections"][0].get("content", ""))
+        txt = "\n\n".join(parts)[:1200]
+        # extract first 2 sentences as a short summary
+        sents = re.split(r"(?<=[.!?])\\s+", txt)
+        return (sents[0] + (" " + sents[1] if len(sents) > 1 else "")) if sents and sents[0] else txt
+
+    summary = _make_summary(details)
+    if summary:
+        details["summary"] = summary
+
+    # Keep only requested/curated keys.
+    details = {k: v for k, v in details.items() if k in ALLOWED_DRUG_DETAIL_KEYS and v}
+
+    return details
+
+
+def _sanitize_result_row(row):
+    details = row.get("drug_details") or {}
+    details = {k: v for k, v in details.items() if k in ALLOWED_DRUG_DETAIL_KEYS and v}
+    return {
+        "brand_name": (row.get("brand_name") or "").strip(),
+        "generic_name": (row.get("generic_name") or "").strip(),
+        "strength": (row.get("strength") or "").strip(),
+        "dosage_form": (row.get("form") or "").strip(),
+        "form": (row.get("form") or "").strip(),
+        "source_urls": row.get("source_urls") or [],
+        "drug_details": details,
+    }
+
+
 # ---------------------------------------------------------
 # RxNorm resolver
 # ---------------------------------------------------------
@@ -598,18 +986,25 @@ def _scrape_page(url, generic):
     site = urlparse(url).netloc.replace("www.", "").lower()
     tree = HTMLParser(html)
     body_node = tree.css_first("body")
-    page_text = body_node.text(separator=" ", strip=True)[:4000] if body_node else html[:4000]
+    page_text = body_node.text(separator="\n", strip=True) if body_node else html
+
+    page_title = ""
+    title_node = tree.css_first("title")
+    if title_node:
+        page_title = title_node.text(strip=True)
 
     brand_name = ""
     scraped_generic = ""
 
     # 1) JSON-LD structured data
     brand_name, scraped_generic = _extract_from_jsonld(html)
+    if _norm(brand_name) in BAD_BRAND_TOKENS:
+        brand_name = ""
 
     # 1b) Explicit label-driven extraction from page text.
     # If the page says "Brand Name" or "Generic Name", prefer those fields.
     labelled_brand, labelled_generic = _extract_labelled_names(page_text)
-    if labelled_brand:
+    if labelled_brand and _norm(labelled_brand) not in BAD_BRAND_TOKENS:
         brand_name = labelled_brand
     if labelled_generic:
         scraped_generic = labelled_generic
@@ -636,6 +1031,8 @@ def _scrape_page(url, generic):
             if node:
                 raw = node.text(strip=True)
                 cleaned = _clean_brand_text(raw)
+                if _norm(cleaned) in BAD_BRAND_TOKENS:
+                    continue
                 if cleaned and _norm(cleaned) != _norm(generic):
                     brand_name = cleaned
                     break
@@ -646,6 +1043,8 @@ def _scrape_page(url, generic):
         if title_node:
             raw = title_node.text(strip=True)
             cleaned = _clean_brand_text(re.split(r"[:|]", raw)[0])
+            if _norm(cleaned) in BAD_BRAND_TOKENS:
+                cleaned = ""
             if cleaned and _norm(cleaned) != _norm(generic):
                 brand_name = cleaned
 
@@ -694,6 +1093,9 @@ def _scrape_page(url, generic):
         "generic_name": resolved_generic,
         "strength": strength,
         "form": form,
+        "page_title": page_title,
+        "full_content": page_text,
+        "snippet": page_text[:600],
         "source_site": site,
         "source_url": url,
     }
@@ -814,6 +1216,9 @@ def search_variants(query):
                 "generic_name": (r.get("generic_name") or generic).strip(),
                 "strength": r.get("strength", "").strip(),
                 "form": r.get("form", "").strip(),
+                "page_title": r.get("page_title", "").strip(),
+                "full_content": r.get("full_content", "").strip(),
+                "snippet": r.get("snippet", "").strip(),
                 "source_urls": [source] if source.get("site") else [],
             }
         else:
@@ -824,12 +1229,26 @@ def search_variants(query):
             for field in ("strength", "form"):
                 if not existing.get(field) and r.get(field):
                     existing[field] = r[field]
+            for field in ("page_title", "snippet"):
+                if not existing.get(field) and r.get(field):
+                    existing[field] = r[field]
+            incoming_content = (r.get("full_content") or "").strip()
+            if incoming_content and len(incoming_content) > len(existing.get("full_content", "")):
+                existing["full_content"] = incoming_content
 
     results = list(merged.values())
 
+    for row in results:
+        row["drug_details"] = _build_drug_details_block(row)
+
     def _sort_key(row):
         first_site = (row.get("source_urls") or [{}])[0].get("site", "")
-        return (0 if is_indian_domain(first_site) else 1, _norm(row.get("brand_name")))
+        return (
+            0 if is_indian_domain(first_site) else 1,
+            0 if row.get("full_content") else 1,
+            -len(row.get("full_content", "")),
+            _norm(row.get("brand_name")),
+        )
 
     results.sort(key=_sort_key)
 
@@ -898,15 +1317,34 @@ def api_search():
     qtype, generic, results = search_variants(q)
     init_sqlite_db()
     saved_count = save_results_to_sqlite(q, qtype, generic, results)
-    return jsonify({
+    clean_results = [_sanitize_result_row(r) for r in results]
+
+    # Build a dictionary-to-dictionary style chain so each variant has a "next" block.
+    variants = []
+    for i, row in enumerate(clean_results):
+        next_row = clean_results[i + 1] if i + 1 < len(clean_results) else None
+        row_with_next = dict(row)
+        row_with_next["next"] = {
+            "brand_name": (next_row.get("brand_name") or "").strip(),
+            "generic_name": (next_row.get("generic_name") or "").strip(),
+            "strength": (next_row.get("strength") or "").strip(),
+            "form": (next_row.get("form") or "").strip(),
+            "source_urls": next_row.get("source_urls") or [],
+        } if next_row else None
+        variants.append(row_with_next)
+
+    response = {
         "query": q,
         "query_type": qtype,
         "generic_name": generic,
-        "total_variants": len(results),
+        "total_variants": len(variants),
         "saved_to_sqlite": saved_count,
         "sqlite_db": LOCAL_DB_PATH,
-        "results": results,
-    })
+        "featured_result": variants[0] if variants else {},
+        "drug_details": ((variants[0] or {}).get("drug_details") if variants else {}),
+        "results": variants,
+    }
+    return Response(json.dumps(response, ensure_ascii=False, indent=2), mimetype="application/json")
 
 
 @app.route("/")

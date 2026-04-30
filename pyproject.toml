@@ -7,6 +7,7 @@ requires-python = ">=3.14"
 dependencies = [
     "brotli>=1.2.0",
     "cssselect>=1.2.0",
+    "ddgs>=9.14.1",
     "fake-useragent>=1.4.0",
     "pandas>=2.3.3",
     "playwright>=1.35.0",

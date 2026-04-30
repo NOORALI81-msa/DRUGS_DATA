@@ -3,7 +3,7 @@ import json
 import sqlite3
 import requests
 import concurrent.futures
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 from collections import Counter
 from flask import Flask, request, jsonify
 
@@ -121,6 +121,33 @@ def parse_strength_form(text):
     if f:
         form = f.group(1).title()
 
+    return strength, form
+
+
+def _extract_domain_from_url(value):
+    url = (value or "").strip()
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    domain = (parsed.netloc or parsed.path.split("/")[0]).strip().lower()
+    if domain.startswith("www."):
+        domain = domain[4:]
+    return domain
+
+
+def _infer_strength_form(*texts):
+    strength = ""
+    form = ""
+    for text in texts:
+        if not text:
+            continue
+        candidate_strength, candidate_form = parse_strength_form(str(text))
+        if not strength and candidate_strength:
+            strength = candidate_strength
+        if not form and candidate_form:
+            form = candidate_form
+        if strength and form:
+            break
     return strength, form
 
 
@@ -698,12 +725,25 @@ def search_mongo_database(query, generic, brand_names):
                 or generic
             )
 
-            strength = str(doc.get("strength") or data.get("strength") or "").strip()
-            form = str(doc.get("form") or data.get("form") or "").strip()
-            source_site = str(doc.get("site_domain") or doc.get("domain") or "mongodb").strip()
             source_url = str(doc.get("url") or data.get("url") or "").strip()
             if not source_url:
                 source_url = str(data.get("drug_url") or "").strip()
+
+            strength, form = _infer_strength_form(
+                doc.get("strength"),
+                data.get("strength"),
+                doc.get("title"),
+                data.get("title"),
+                doc.get("drug_name"),
+                data.get("drug_name"),
+                brand_name,
+            )
+
+            source_site = str(doc.get("site_domain") or doc.get("domain") or "").strip()
+            if not source_site:
+                source_site = _extract_domain_from_url(source_url)
+            if not source_site:
+                source_site = "mongodb"
 
             rows.append({
                 "brand_name": brand_name,
@@ -715,7 +755,10 @@ def search_mongo_database(query, generic, brand_names):
                 "source_url": source_url,
                 "data_section": _json_safe(data),
             })
-    except Exception:
+    except Exception as e:
+        print(f"[ERROR] search_mongo_database failed: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         return []
     finally:
         if client:
@@ -992,6 +1035,16 @@ def search_variants_from_databases(query):
     # Output shape: only source_urls list to avoid repeating source fields multiple times.
     response_rows = []
     for row in final_rows[:50]:
+        # Merge full_content from all data_sections for easier access
+        full_content_parts = []
+        for data_section in row.get("data_sections", []):
+            if isinstance(data_section, dict):
+                fc = data_section.get("full_content", "")
+                if fc and isinstance(fc, str) and fc.strip():
+                    full_content_parts.append(fc)
+        
+        merged_full_content = "\n\n---\n\n".join(full_content_parts) if full_content_parts else ""
+        
         response_rows.append({
             "brand_name": row.get("brand_name", ""),
             "generic_name": row.get("generic_name", ""),
@@ -1000,6 +1053,7 @@ def search_variants_from_databases(query):
             "form": row.get("form", ""),
             "match_tier": _row_match_tier(row, q),
             "source_urls": _dedupe_source_urls(row.get("source_urls", [])),
+            "full_content": merged_full_content,
             "data_sections": row.get("data_sections", []),
         })
 

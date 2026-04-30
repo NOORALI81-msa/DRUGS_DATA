@@ -1872,6 +1872,13 @@ class DrugSpider(scrapy.Spider):
         for key in ['description', 'overview', 'uses', 'benefits', 'side_effects', 'dosage', 'how_to_use', 'warnings', 'quick_tips', 'safety_advice', 'fact_box', 'patient_concerns', 'user_feedback', 'faqs', 'substitutes', 'price']:
             if flat_data.get(key):
                 content_parts.append(f"## {key.replace('_', ' ').title()}\n{flat_data[key]}")
+        
+        # Fallback: include fda_summary and other_info if content_parts is empty or as additional sections
+        if flat_data.get('fda_summary'):
+            content_parts.append(f"## FDA Summary\n{flat_data['fda_summary']}")
+        if flat_data.get('other_info'):
+            content_parts.append(f"## Other Information\n{flat_data['other_info']}")
+        
         flat_data['full_content'] = '\n\n'.join(content_parts) if content_parts else ''
         
         # 6. Remove completely empty strict columns to declutter CSV a bit 
